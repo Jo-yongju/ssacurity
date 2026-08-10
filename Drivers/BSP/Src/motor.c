@@ -204,7 +204,10 @@ void Motor_SetPercent(float percent)
     requested_percent = -requested_percent;
   }
 
-  /* Never leave forward and reverse PWM active at the same time. */
+  /*
+   * Clear both sides before selecting a direction. This prevents forward and
+   * reverse PWM from being active at the same time during a direction change.
+   */
   SetBothPwmChannelsToZero();
 
   if (requested_percent > 0.0f)
