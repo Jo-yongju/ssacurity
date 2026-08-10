@@ -60,7 +60,10 @@ void Encoder_Update(float dt_seconds, EncoderSample *sample)
 
   current_counter = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
 
-  /* Preserve a small signed delta across the 16-bit counter wraparound. */
+  /*
+   * TIM4 is 16-bit. Casting the unsigned subtraction to int16_t preserves
+   * a small forward/reverse delta even when CNT wraps at 0 or 65535.
+   */
   wrapped_delta =
       (int16_t)(uint16_t)(current_counter - previous_counter);
   previous_counter = current_counter;
@@ -72,8 +75,8 @@ void Encoder_Update(float dt_seconds, EncoderSample *sample)
   last_sample.total_count = total_count;
   last_sample.delta_distance_m = 0.0f;
   last_sample.total_distance_m = 0.0f;
-  last_sample.speed_mps = 0.0f;
   last_sample.calibrated = calibrated;
+  last_sample.speed_mps = 0.0f;
 
   if (calibrated)
   {
