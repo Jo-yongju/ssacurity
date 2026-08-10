@@ -1,83 +1,123 @@
-/*
- * encoder.c
- *
- */
-
-#define WHEEL_DIAMETER_M       0.064f			//바퀴 지름 m 단위
-#define CONTROL_DT_SEC         0.01f			//
-#define COUNTS_PER_WHEEL_REV	823.0f				// 회전당 엔코더 카운트 수
-#define PI 3.14159265359f
-
 #include "encoder.h"
+
+#include "main.h"
+
+#include <string.h>
+
 extern TIM_HandleTypeDef htim4;
 
+static bool encoder_initialized;
+static uint16_t previous_counter;
+static int64_t total_count;
+static float counts_per_wheel_revolution =
+    ENCODER_DEFAULT_COUNTS_PER_WHEEL_REV;
+static float wheel_circumference_m =
+    ENCODER_DEFAULT_WHEEL_CIRCUMFERENCE_M;
+static int8_t encoder_direction_sign = 1;
+static EncoderSample last_sample;
 
-/*
- * TIM4 Encoder Mode를 시작하고
- * 정·역방향 카운트를 위해 CNT를 중앙값으로 초기화한다.
- */
-
-void Encoder_Init(void){
-	HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_1);
-	HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_2);
-
-	TIM4 ->CNT = 32768U;
-}
-
-
-
-
-/*
- * TIM4의 현재 엔코더 카운트와 중앙값의 차이를 반환하고,
- * 다음 측정을 위해 CNT를 다시 중앙값으로 초기화한다.
- */
-
-/*
- * 32768로 시작
-      ↓
-* 10ms 동안 증가/감소
-      ↓
-* CNT - 32768로 이동량 계산
-      ↓
-* 다시 32768로 초기화
-      ↓
-* 다음 10ms 측정
- */
-
-int32_t Encoder_GetDiff(void)
+bool Encoder_Init(void)
 {
-    // 현재 CNT 읽기
-	uint32_t current_cnt = TIM4->CNT;
-    // 현재값 - 32768 계산
-	int32_t diff =  (int32_t) current_cnt - 32768;
-    // CNT를 32768로 재설정
-	TIM4->CNT = 32768;
-    // 차이값 반환
-	return diff;
+  if (HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL) != HAL_OK)
+  {
+    return false;
+  }
+
+  previous_counter = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
+  total_count = 0;
+  memset(&last_sample, 0, sizeof(last_sample));
+  last_sample.calibrated = Encoder_IsCalibrated();
+  encoder_initialized = true;
+  return true;
 }
 
-
-/*
- * 일정 시간 동안 측정한 엔코더 차이값을
- * 바퀴의 실제 선속도(m/s)로 변환한다.
- */
-float Encoder_GetSpeedMps(int32_t diff_ticks)
+void Encoder_Reset(void)
 {
-    // 바퀴 둘레 계산
-	float wheel_circumference = PI* WHEEL_DIAMETER_M ;
-
-    // 엔코더 1틱당 이동거리 계산
-	float distance_per_tick = wheel_circumference / COUNTS_PER_WHEEL_REV;
-
-    // diff_ticks로 이동거리 계산
-	float distance = diff_ticks * distance_per_tick;
-    // 0.01초로 나누어 속도 계산
-	float v = distance / CONTROL_DT_SEC;
-    // 속도 반환
-	return v;
+  __HAL_TIM_SET_COUNTER(&htim4, 0U);
+  previous_counter = 0U;
+  total_count = 0;
+  memset(&last_sample, 0, sizeof(last_sample));
+  last_sample.calibrated = Encoder_IsCalibrated();
 }
 
+void Encoder_Update(float dt_seconds, EncoderSample *sample)
+{
+  uint16_t current_counter;
+  int16_t wrapped_delta;
+  int32_t signed_delta;
+  bool calibrated;
 
+  if (sample == NULL)
+  {
+    return;
+  }
 
+  if (!encoder_initialized)
+  {
+    memset(sample, 0, sizeof(*sample));
+    return;
+  }
 
+  current_counter = (uint16_t)__HAL_TIM_GET_COUNTER(&htim4);
 
+  /* Preserve a small signed delta across the 16-bit counter wraparound. */
+  wrapped_delta =
+      (int16_t)(uint16_t)(current_counter - previous_counter);
+  previous_counter = current_counter;
+  signed_delta = (int32_t)wrapped_delta * (int32_t)encoder_direction_sign;
+  total_count += signed_delta;
+
+  calibrated = Encoder_IsCalibrated();
+  last_sample.delta_count = signed_delta;
+  last_sample.total_count = total_count;
+  last_sample.delta_distance_m = 0.0f;
+  last_sample.total_distance_m = 0.0f;
+  last_sample.speed_mps = 0.0f;
+  last_sample.calibrated = calibrated;
+
+  if (calibrated)
+  {
+    float delta_revolutions =
+        (float)signed_delta / counts_per_wheel_revolution;
+    float total_revolutions =
+        (float)total_count / counts_per_wheel_revolution;
+
+    last_sample.delta_distance_m =
+        delta_revolutions * wheel_circumference_m;
+    last_sample.total_distance_m =
+        total_revolutions * wheel_circumference_m;
+    if (dt_seconds > 0.0f)
+    {
+      last_sample.speed_mps =
+          last_sample.delta_distance_m / dt_seconds;
+    }
+  }
+
+  *sample = last_sample;
+}
+
+bool Encoder_SetCalibration(float counts_per_revolution,
+                            float circumference_m)
+{
+  if ((counts_per_revolution <= 0.0f) || (circumference_m <= 0.0f))
+  {
+    counts_per_wheel_revolution = 0.0f;
+    wheel_circumference_m = 0.0f;
+    return false;
+  }
+
+  counts_per_wheel_revolution = counts_per_revolution;
+  wheel_circumference_m = circumference_m;
+  return true;
+}
+
+bool Encoder_IsCalibrated(void)
+{
+  return (counts_per_wheel_revolution > 0.0f) &&
+         (wheel_circumference_m > 0.0f);
+}
+
+void Encoder_SetDirectionSign(int8_t direction_sign)
+{
+  encoder_direction_sign = (direction_sign < 0) ? -1 : 1;
+}

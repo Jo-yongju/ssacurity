@@ -1,23 +1,17 @@
-/*
- motor.h
+#ifndef BSP_MOTOR_H
+#define BSP_MOTOR_H
 
- */
+#include <stdbool.h>
 
+bool Motor_Init(void);
+void Motor_Enable(void);
+void Motor_Disable(void);
+bool Motor_IsEnabled(void);
+void Motor_EmergencyDisable(void);
+bool Motor_ClearEmergencyDisable(void);
+bool Motor_IsEmergencyDisabled(void);
+void Motor_SetPercent(float percent);
+float Motor_GetAppliedPercent(void);
+void Motor_SetDirectionInverted(bool inverted);
 
-#ifndef BSP_INC_MOTOR_H_
-#define BSP_INC_MOTOR_H_
-
-#include "main.h"
-
-
-void DriveMotor_Init(void);
-void Motor_SetPWM(float pwm_percent);
-
-
-
-
-
-
-
-
-#endif /* BSP_INC_MOTOR_H_ */
+#endif
