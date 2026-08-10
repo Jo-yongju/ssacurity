@@ -1,5 +1,10 @@
 # 싸큐리티 Jetson-STM32 UART Protocol V1
 
+> **폐기된 과거 규격:** 활성 펌웨어는 V3.0 / wire protocol `0x02`를
+> 사용한다. 현재 기준은
+> [`jetson_stm32_uart_interface_v3.md`](jetson_stm32_uart_interface_v3.md)다.
+> 이 문서는 과거 벤치 시험 기록을 위해서만 보존한다.
+
 기준일: 2026-07-26  
 상태: STM32 파트 기준안  
 적용 대상: Jetson Orin - STM32F429 주행 제어기
@@ -72,7 +77,7 @@ CommService_Init(&huart5);  /* Jetson/CP2102 */
 - 정상 송신 때마다 1 증가하고 `255 -> 0`으로 순환한다.
 - 동일 Sequence 또는 명백히 과거인 프레임은 다시 실행하지 않는다.
 - 통신 Timeout 이후에는 수신 Sequence 동기화를 새로 시작한다.
-- `DIAG_ECHO_RESPONSE`는 요청의 Sequence를 그대로 돌려준다.
+- 진단 Response는 대응하는 Request의 Sequence를 그대로 돌려준다.
 
 ## 4. 메시지 목록
 
@@ -86,6 +91,10 @@ CommService_Init(&huart5);  /* Jetson/CP2102 */
 | `0x82` | STM32 -> Jetson | `TELEMETRY_SENSOR` | 예약, 사용 금지 |
 | `0xF0` | PC/Jetson -> STM32 | `DIAG_ECHO_REQUEST` | 0~32 |
 | `0xF1` | STM32 -> PC/Jetson | `DIAG_ECHO_RESPONSE` | 요청과 동일 |
+| `0xF2` | PC -> STM32 | `DIAG_MOTOR_TEST_REQUEST` | 4 |
+| `0xF3` | STM32 -> PC | `DIAG_MOTOR_TEST_RESPONSE` | 5 |
+| `0xF4` | PC -> STM32 | `DIAG_PID_TEST_REQUEST` | 4 |
+| `0xF5` | STM32 -> PC | `DIAG_PID_TEST_RESPONSE` | 5 |
 
 ## 5. Payload 정의
 
@@ -213,6 +222,68 @@ Golden response:
 AA 55 01 F1 00 05 53 54 4D 33 32 0F E7
 ```
 
+### 5.7 DIAG_MOTOR_TEST - 0xF2 / 0xF3
+
+PC 벤치 시험 전용 명령이다. 실제 Jetson 주행 제어에서는 사용하지 않고
+`CMD_DRIVE`를 사용한다.
+
+Request Payload:
+
+| Offset | 크기 | 형식 | 필드 | 단위/규칙 |
+|---:|---:|---|---|---|
+| 0 | 2 | `int16` | duty_permille | 0 또는 -600~-200 / 200~600, 0.1% |
+| 2 | 2 | `uint16` | duration_ms | 100~10000ms |
+
+`duty_permille=0`은 즉시 정지 요청이며 `duration_ms`는 0으로 정규화한다.
+실차의 모터 dead zone 때문에 비영 진단 출력은 절댓값 20% 이상만 허용한다.
+그 외 값은 지정된 시간이 지나면 펌웨어가 자동으로 출력을 비활성화한다.
+
+Response Payload:
+
+| Offset | 크기 | 형식 | 필드 |
+|---:|---:|---|---|
+| 0 | 1 | `uint8` | status |
+| 1 | 2 | `int16` | accepted_duty_permille |
+| 3 | 2 | `uint16` | accepted_duration_ms |
+
+Status는 `0=ACCEPTED`, `1=INVALID_PAYLOAD`, `2=OUT_OF_RANGE`이다. 응답은
+명령 수락 여부이며 물리적인 모터 회전 성공을 의미하지 않는다.
+
+모터 진단 요청이 들어오면 STM32는 표준 `TELEMETRY_DRIVE(0x80)`도 활성화한다.
+PC 도구는 이 운영 텔레메트리의 `encoder_count`와 `motor_duty_permille`을
+사용해 엔코더 방향, 카운트 변화 및 자동 정지를 검증한다. 별도의 엔코더
+진단 Message ID를 추가하지 않는다.
+
+### 5.8 DIAG_PID_TEST - 0xF4 / 0xF5
+
+PC 벤치 시험 전용 폐루프 속도 진단이다. 생산용 `CMD_DRIVE` 제한을 해제하지
+않고 `ControlTask`의 엔코더 속도 계산, PID, 모터 출력 경로를 시간 제한으로
+검증한다.
+
+Request Payload:
+
+| Offset | 크기 | 형식 | 필드 | 단위/규칙 |
+|---:|---:|---|---|---|
+| 0 | 2 | `int16` | target_speed_mm_s | -300~300, 0 제외 |
+| 2 | 2 | `uint16` | duration_ms | 500~5000ms |
+
+Response Payload:
+
+| Offset | 크기 | 형식 | 필드 |
+|---:|---:|---|---|
+| 0 | 1 | `uint8` | status |
+| 1 | 2 | `int16` | accepted_target_speed_mm_s |
+| 3 | 2 | `uint16` | accepted_duration_ms |
+
+Status는 `0=ACCEPTED`, `1=INVALID_PAYLOAD`, `2=OUT_OF_RANGE`이다. PID 출력은
+최대 절댓값 95%로 제한되며 시간이 만료되면 자동 정지한다. PC 도구도 시험
+종료 시 별도의 정지 요청을 보내 이중으로 출력을 차단한다.
+
+현재 적용 보정값은 `1600 count/rev`, 바퀴 둘레 `201.06mm`이다. PC 시험
+도구는 기존 텔레메트리 형식을 변경하지 않고 `encoder_count` 변화량과
+`uptime_ms`로 휠 RPM을 계산한다. 최종 차량 장착 후 실제 회전수와
+이동거리로 보정값을 다시 확인한다.
+
 ## 6. 오류 처리
 
 | 조건 | 처리 |
@@ -227,7 +298,7 @@ AA 55 01 F1 00 05 53 54 4D 33 32 0F E7
 | 마지막 유효 CMD_DRIVE > 300ms | 중립 명령 게시, Timeout, 재무장 요구 |
 | UART/DMA 오류 | 오류 카운터 증가 후 RX DMA 재시작 시도 |
 
-## 7. PC Echo 시험
+## 7. PC 시험
 
 ST-LINK USB를 PC에 연결하고 COM 포트를 확인한다.
 
@@ -246,6 +317,40 @@ Protocol echo: PASS
 
 일반 시리얼 터미널에서 문자를 입력하는 Raw Echo가 아니다. 반드시 V1 프레임을
 생성하는 이 도구 또는 같은 규격을 구현한 Jetson 프로그램으로 시험한다.
+
+모터를 비활성화한 상태에서 현재 엔코더 값을 읽는다.
+
+```powershell
+py tools\uart_protocol_test.py encoder-read --port COM14
+```
+
+바퀴를 손으로 정확히 한 바퀴 돌려 방향과 한 바퀴당 카운트를 측정한다.
+
+```powershell
+py tools\uart_protocol_test.py encoder-monitor --port COM14 --seconds 10
+```
+
+바퀴를 지면에서 띄운 뒤 제한시간 모터 출력과 엔코더 방향을 함께 검사한다.
+
+```powershell
+py tools\uart_protocol_test.py encoder-test --port COM14 --percent 30 --duration 1000
+py tools\uart_protocol_test.py encoder-test --port COM14 --percent -30 --duration 1000
+```
+
+양수 PWM에서 Count가 증가하고 음수 PWM에서 Count가 감소해야 현재 소프트웨어
+방향 정의와 일치한다. 반대로 나오면 배선을 임의로 바꾸기 전에
+`Encoder_SetDirectionSign(-1)`로 좌표계 부호를 보정한다.
+
+임시 보정값으로 시간 제한 PID 속도 시험을 실행한다.
+
+```powershell
+py tools\uart_protocol_test.py pid-test --port COM14 --target-mm-s 150 --duration 3000
+```
+
+펌웨어와 PC 도구는 PID 제어 주기와 같은 약 10ms 간격으로 목표속도,
+측정속도, 목표 휠 RPM, 측정 휠 RPM, PWM 및 누적 엔코더 Count를 표시한다.
+시험 후반부 평균속도, 평균 휠 RPM, 평균 오차와 최대 PWM을 요약한다.
+첫 시험은 바퀴를 지면에서 띄우고 `+150mm/s`부터 시작한다.
 
 ## 8. 구현 파일
 
