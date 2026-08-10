@@ -22,8 +22,11 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "app_freertos.h"
 #include "comm_service.h"
-#include "task_control.h"
+#include "task_imu.h"
+#include "ultrasonic.h"
+#include "vehicle_config.h"
 
 /* USER CODE END Includes */
 
@@ -43,6 +46,11 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
+SPI_HandleTypeDef hspi5;
+
+TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim5;
@@ -50,25 +58,19 @@ TIM_HandleTypeDef htim5;
 UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_tx;
 DMA_HandleTypeDef hdma_usart1_rx;
+UART_HandleTypeDef huart5;
+DMA_HandleTypeDef hdma_uart5_rx;
+DMA_HandleTypeDef hdma_uart5_tx;
 
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 512 * 4,
+  .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for ControlTask */
-osThreadId_t ControlTaskHandle;
-const osThreadAttr_t ControlTask_attributes = {
-  .name = "ControlTask",
-  .stack_size = 512 * 4,
-  .priority = (osPriority_t) osPriorityAboveNormal,
-};
 /* USER CODE BEGIN PV */
-ControlState_t debug_control_state;
-volatile int16_t telemetry_target_speed_mm_s = 0;
-volatile int16_t telemetry_target_steering_cdeg = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -76,11 +78,14 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_UART5_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_SPI5_Init(void);
+static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_TIM5_Init(void);
 void StartDefaultTask(void *argument);
-void StartControlTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -122,16 +127,26 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART1_UART_Init();
+  MX_UART5_Init();
+  MX_ADC1_Init();
+  MX_SPI5_Init();
+  MX_TIM2_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
   MX_TIM5_Init();
+
   /* USER CODE BEGIN 2 */
   /*
-   * PC protocol-Echo test: USART1 is routed through the on-board ST-LINK VCP.
-   * Jetson migration: configure UART5 in CubeMX, then change only &huart1 to
-   * &huart5 here. The transport, parser and protocol remain unchanged.
+   * Jetson protocol V3.0: UART5 is routed to PC12 TX / PD2 RX.
+   * USART1 is routed through the on-board ST-LINK VCP for bench calibration.
+   * Select the active transport in vehicle_config.h.
    */
+
+#if VEHICLE_COMM_USE_STLINK_VCP
   if (!CommService_Init(&huart1))
+#else
+  if (!CommService_Init(&huart5))
+#endif
   {
     Error_Handler();
   }
@@ -161,11 +176,8 @@ int main(void)
   /* creation of defaultTask */
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
-  /* creation of ControlTask */
-  ControlTaskHandle = osThreadNew(StartControlTask, NULL, &ControlTask_attributes);
-
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  App_FreeRTOS_Init();
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -181,11 +193,10 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
+    /* Execution is owned by FreeRTOS after osKernelStart(). */
   }
   /* USER CODE END 3 */
 }
@@ -208,19 +219,14 @@ void SystemClock_Config(void)
   * in the RCC_OscInitTypeDef structure.
   */
   /*
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 4;
-  RCC_OscInitStruct.PLL.PLLN = 180;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 7;*/
-
+   * This board does not currently receive the 8 MHz ST-LINK MCO on OSC_IN.
+   * HSE bypass therefore never asserts HSERDY and HAL_RCC_OscConfig() times
+   * out before the RTOS and UART are started.  Use the internal 16 MHz HSI
+   * as the PLL source while keeping the requested 180 MHz system clock.
+   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = 8;
@@ -252,6 +258,136 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /*
+   * PC3 / ADC1_IN13 reads the PP-A818/AS5600 analog output.
+   * PCLK2 is 90 MHz; DIV4 gives a 22.5 MHz ADC clock, below the
+   * STM32F429 36 MHz maximum.  A long sample time gives the external
+   * sensor output enough acquisition time without DMA or interrupts.
+   */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sConfig.Channel = ADC_CHANNEL_13;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_144CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief SPI5 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI5_Init(void)
+{
+  /*
+   * BNO085 SPI: mode 3, MSB first, maximum 3 MHz.
+   * SPI5 uses the 90 MHz APB2 clock; /32 gives 2.8125 MHz.
+   * Chip select is software-controlled on PF6 so SPI5 can remain shared
+   * with the disabled on-board L3GD20 (PC1 held high).
+   */
+  hspi5.Instance = SPI5;
+  hspi5.Init.Mode = SPI_MODE_MASTER;
+  hspi5.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi5.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi5.Init.CLKPolarity = SPI_POLARITY_HIGH;
+  hspi5.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi5.Init.NSS = SPI_NSS_SOFT;
+  hspi5.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+  hspi5.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi5.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi5.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi5.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  /*
+   * APB1 timer clock = 90 MHz.
+   * 90 MHz / (89 + 1) = 1 MHz, or 1 us per free-running count.
+   */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 89;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 0xFFFFFFFFU;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_IC_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
 }
 
 /**
@@ -299,7 +435,7 @@ static void MX_TIM3_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 1500;
+  sConfigOC.Pulse = 1231;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
@@ -381,12 +517,16 @@ static void MX_TIM5_Init(void)
   /* USER CODE BEGIN TIM5_Init 1 */
 
   /* USER CODE END TIM5_Init 1 */
+  /*
+   * APB1 timer clock = 90 MHz.
+   * 90 MHz / (8 + 1) / (499 + 1) = 20 kHz motor PWM.
+   */
   htim5.Instance = TIM5;
   htim5.Init.Prescaler = 8;
   htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim5.Init.Period = 499;
   htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim5) != HAL_OK)
   {
     Error_Handler();
@@ -459,15 +599,55 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
+  * @brief UART5 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART5_Init(void)
+{
+
+  /* USER CODE BEGIN UART5_Init 0 */
+
+  /* USER CODE END UART5_Init 0 */
+
+  /* USER CODE BEGIN UART5_Init 1 */
+
+  /* USER CODE END UART5_Init 1 */
+  huart5.Instance = UART5;
+  huart5.Init.BaudRate = 115200;
+  huart5.Init.WordLength = UART_WORDLENGTH_8B;
+  huart5.Init.StopBits = UART_STOPBITS_1;
+  huart5.Init.Parity = UART_PARITY_NONE;
+  huart5.Init.Mode = UART_MODE_TX_RX;
+  huart5.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart5.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN UART5_Init 2 */
+
+  /* USER CODE END UART5_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
 {
 
   /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
   __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
+  /* DMA1_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+  /* DMA1_Stream7_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream7_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream7_IRQn);
   /* DMA2_Stream2_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
@@ -490,23 +670,34 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOE, BTS_R_EN_Pin|BTS_L_EN_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, CSX_Pin|OTG_FS_PSO_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, NCS_MEMS_SPI_Pin|CSX_Pin|OTG_FS_PSO_Pin, GPIO_PIN_RESET);
+  /* Keep the on-board L3GD20 deselected while SPI5 is used by BNO085. */
+  HAL_GPIO_WritePin(NCS_MEMS_SPI_GPIO_Port,
+                    NCS_MEMS_SPI_Pin,
+                    GPIO_PIN_SET);
+
+  /* BNO085 is deselected and released from reset until ImuTask starts. */
+  HAL_GPIO_WritePin(BNO085_CS_GPIO_Port, BNO085_CS_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(BNO085_RST_GPIO_Port, BNO085_RST_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(ACP_RST_GPIO_Port, ACP_RST_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(ULTRASONIC_TRIG_GPIO_Port,
+                    ULTRASONIC_TRIG_Pin,
+                    GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOD, RDX_Pin|WRX_DCX_Pin, GPIO_PIN_RESET);
@@ -514,12 +705,8 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOG, LD3_Pin|LD4_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : BTS_R_EN_Pin BTS_L_EN_Pin */
-  GPIO_InitStruct.Pin = BTS_R_EN_Pin|BTS_L_EN_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOE, BTS_R_EN_Pin|BTS_L_EN_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : A0_Pin A1_Pin A2_Pin A3_Pin
                            A4_Pin A5_Pin SDNRAS_Pin A6_Pin
@@ -531,14 +718,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   GPIO_InitStruct.Alternate = GPIO_AF12_FMC;
-  HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : SPI5_SCK_Pin SPI5_MISO_Pin SPI5_MOSI_Pin */
-  GPIO_InitStruct.Pin = SPI5_SCK_Pin|SPI5_MISO_Pin|SPI5_MOSI_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF5_SPI5;
   HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
 
   /*Configure GPIO pin : ENABLE_Pin */
@@ -564,14 +743,38 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : BNO085_CS_Pin */
+  GPIO_InitStruct.Pin = BNO085_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(BNO085_CS_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : BNO085_RST_Pin */
+  GPIO_InitStruct.Pin = BNO085_RST_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(BNO085_RST_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : BNO085_INT_Pin */
+  GPIO_InitStruct.Pin = BNO085_INT_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(BNO085_INT_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI3 interrupt init: ISR only wakes ImuTask; SPI runs in task context. */
+  HAL_NVIC_SetPriority(EXTI3_IRQn, 6, 0);
+  HAL_NVIC_EnableIRQ(EXTI3_IRQn);
+
   /*Configure GPIO pins : MEMS_INT2_Pin TP_INT1_Pin */
   GPIO_InitStruct.Pin = MEMS_INT2_Pin|TP_INT1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : VSYNC_Pin G2_Pin R4_Pin R5_Pin */
-  GPIO_InitStruct.Pin = VSYNC_Pin|G2_Pin|R4_Pin|R5_Pin;
+  /*Configure GPIO pins : VSYNC_Pin R4_Pin R5_Pin */
+  GPIO_InitStruct.Pin = VSYNC_Pin|R4_Pin|R5_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -584,6 +787,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(ACP_RST_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : ULTRASONIC_TRIG_Pin */
+  GPIO_InitStruct.Pin = ULTRASONIC_TRIG_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(ULTRASONIC_TRIG_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : OTG_FS_OC_Pin */
   GPIO_InitStruct.Pin = OTG_FS_OC_Pin;
@@ -605,9 +815,9 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(BOOT1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : A10_Pin A11_Pin PG4 BA1_Pin
+  /*Configure GPIO pins : A10_Pin A11_Pin BA0_Pin BA1_Pin
                            SDCLK_Pin SDNCAS_Pin */
-  GPIO_InitStruct.Pin = A10_Pin|A11_Pin|GPIO_PIN_4|BA1_Pin
+  GPIO_InitStruct.Pin = A10_Pin|A11_Pin|BA0_Pin|BA1_Pin
                           |SDCLK_Pin|SDNCAS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -672,8 +882,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PG6 DOTCLK_Pin B3_Pin */
-  GPIO_InitStruct.Pin = GPIO_PIN_6|DOTCLK_Pin|B3_Pin;
+  /*Configure GPIO pins : R7_Pin DOTCLK_Pin B3_Pin */
+  GPIO_InitStruct.Pin = R7_Pin|DOTCLK_Pin|B3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -735,6 +945,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF12_FMC;
   HAL_GPIO_Init(SDCKE1_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : BTS_R_EN_Pin BTS_L_EN_Pin */
+  GPIO_InitStruct.Pin = BTS_R_EN_Pin|BTS_L_EN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
@@ -756,6 +973,23 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   CommService_OnUartError(huart);
 }
 
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == BNO085_INT_Pin)
+  {
+    ImuTask_OnDataReadyInterrupt();
+  }
+}
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+  if ((htim->Instance == TIM2) &&
+      (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2))
+  {
+    Ultrasonic_OnInputCapture();
+  }
+}
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -768,131 +1002,12 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-  uint32_t next_telemetry_tick = osKernelGetTickCount();
-  uint32_t telemetry_period_ticks = osKernelGetTickFreq() / 100U;
-
-  ControlState_t state;
-  CommDriveTelemetry telemetry = {0};
-
   /* Infinite loop */
-
   for(;;)
   {
-	CommService_Process();
-	uint32_t now_tick = osKernelGetTickCount();
-
-	 if ((int32_t)(now_tick - next_telemetry_tick) >= 0)
-	 {
-	     next_telemetry_tick += telemetry_period_ticks;
-
-	     Control_GetState(&state);
-
-	     telemetry.target_speed_mm_s =
-	         telemetry_target_speed_mm_s;
-
-	     telemetry.measured_speed_mm_s =
-	              (int16_t)(state.measured_speed_mps * 1000.0f);
-
-	     telemetry.encoder_count =
-	         (int32_t)state.total_encoder_ticks;
-
-	     telemetry.motor_duty_permille =
-	         (int16_t)(state.applied_pwm_percent * 10.0f);
-
-	     telemetry.steering_cdeg =
-	         telemetry_target_steering_cdeg;
-
-	     if (CommService_IsCommandTimedOut())
-	     {
-	         telemetry.state = COMM_STATE_SAFE_STOP;
-	         telemetry.active_fault_bits = COMM_FAULT_COMM_TIMEOUT;
-	     }
-	     else if (state.applied_pwm_percent != 0.0f)
-	     {
-	         telemetry.state = COMM_STATE_DRIVING;
-	         telemetry.active_fault_bits = 0U;
-	     }
-	     else
-	     {
-	         telemetry.state = COMM_STATE_READY;
-	         telemetry.active_fault_bits = 0U;
-	     }
-	         telemetry.uptime_ms = HAL_GetTick();
-
-	         (void)CommService_SendDriveTelemetry(&telemetry);
-	   }
-
-
     osDelay(1);
   }
   /* USER CODE END 5 */
-}
-
-/* USER CODE BEGIN Header_StartControlTask */
-/**
-* @brief Function implementing the ControlTask thread.
-* @param argument: Not used
-* @retval None
-*/
-/* USER CODE END Header_StartControlTask */
-void StartControlTask(void *argument)
-{
-  /* USER CODE BEGIN StartControlTask */
-    Control_Init();
-
-    uint32_t next_wake_tick = osKernelGetTickCount();
-    uint32_t period_ticks = osKernelGetTickFreq() / 100U;
-    uint32_t start_ms = HAL_GetTick();
-
-    ControlCommand_t control_command = {
-        .mode = CONTROL_DISABLED,
-        .pwm_percent = 0.0f,
-        .target_speed_mps = 0.0f,
-        .target_steering_deg = 0.0f
-    };
-
-    for (;;)
-    {
-        uint32_t elapsed_ms = HAL_GetTick() - start_ms;
-
-        /* 0~2초 정지 */
-        if (elapsed_ms < 2000U)
-        {
-            control_command.mode = CONTROL_DISABLED;
-            control_command.target_speed_mps = 0.0f;
-
-            telemetry_target_speed_mm_s = 0;
-        }
-        /* 2~17초 PID 구동 */
-        else if (elapsed_ms < 17000U)
-        {
-            control_command.mode = CONTROL_SPEED_PID;
-            control_command.target_speed_mps = 0.3f;
-
-            telemetry_target_speed_mm_s = 300;
-        }
-        /* 17초 이후 정지 */
-        else
-        {
-            control_command.mode = CONTROL_DISABLED;
-            control_command.target_speed_mps = 0.0f;
-
-            telemetry_target_speed_mm_s = 0;
-        }
-
-        control_command.pwm_percent = 0.0f;
-        control_command.target_steering_deg = 0.0f;
-
-        Control_SetCommand(&control_command);
-        Control_Run10ms();
-        Control_GetState(&debug_control_state);
-
-        next_wake_tick += period_ticks;
-        osDelayUntil(next_wake_tick);
-    }
-
-
-  /* USER CODE END StartControlTask */
 }
 
 /**
