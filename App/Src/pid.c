@@ -104,8 +104,8 @@ float PID_Update(PIDController *pid,
   output = ClampOutput(pid, unsaturated_output);
 
   /*
-   * Integrate while unsaturated, or while the error is moving a saturated
-   * output back toward the valid range.
+   * Conditional integration prevents the integral term from winding up while
+   * the output is saturated, but allows it to unwind toward the valid range.
    */
   if ((unsaturated_output == output) ||
       ((output >= pid->output_max) && (error < 0.0f)) ||

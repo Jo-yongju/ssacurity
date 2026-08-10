@@ -2,19 +2,6 @@
 
 #include <string.h>
 
-enum
-{
-  PARSER_WAIT_SOF1 = 0,
-  PARSER_WAIT_SOF2,
-  PARSER_READ_VERSION,
-  PARSER_READ_MESSAGE_ID,
-  PARSER_READ_SEQUENCE,
-  PARSER_READ_LENGTH,
-  PARSER_READ_PAYLOAD,
-  PARSER_READ_CRC_LOW,
-  PARSER_READ_CRC_HIGH
-};
-
 static uint16_t CrcUpdate(uint16_t crc, uint8_t byte)
 {
   crc ^= (uint16_t)byte << 8;
@@ -32,149 +19,241 @@ static uint16_t CrcUpdate(uint16_t crc, uint8_t byte)
   return crc;
 }
 
-static void ResetForNextFrame(CommParser *parser)
+static uint16_t ParserIndex(const CommParser *parser, uint16_t offset)
 {
-  parser->state = PARSER_WAIT_SOF1;
-  parser->payload_index = 0U;
-  parser->calculated_crc = 0xFFFFU;
-  parser->received_crc = 0U;
+  uint16_t index = (uint16_t)(parser->head + offset);
+
+  if (index >= COMM_PROTOCOL_PARSER_BUFFER_SIZE)
+  {
+    index = (uint16_t)(index - COMM_PROTOCOL_PARSER_BUFFER_SIZE);
+  }
+  return index;
+}
+
+static uint8_t ParserPeek(const CommParser *parser, uint16_t offset)
+{
+  return parser->buffer[ParserIndex(parser, offset)];
+}
+
+static void ParserDrop(CommParser *parser, uint16_t length)
+{
+  if (length > parser->count)
+  {
+    length = parser->count;
+  }
+
+  parser->head = ParserIndex(parser, length);
+  parser->count = (uint16_t)(parser->count - length);
+}
+
+static void ParserAppend(CommParser *parser, uint8_t byte)
+{
+  uint16_t index;
+
+  if (parser->count >= COMM_PROTOCOL_PARSER_BUFFER_SIZE)
+  {
+    ParserDrop(parser, 1U);
+    parser->stats.buffer_overflows++;
+    parser->stats.discarded_bytes++;
+  }
+
+  index = ParserIndex(parser, parser->count);
+  parser->buffer[index] = byte;
+  parser->count++;
+}
+
+static void MarkIncomplete(CommParser *parser, uint32_t now_ms)
+{
+  if (!parser->incomplete_timer_active)
+  {
+    parser->incomplete_started_ms = now_ms;
+    parser->incomplete_timer_active = true;
+  }
+}
+
+static bool ExpireIncompleteCandidate(CommParser *parser, uint32_t now_ms)
+{
+  if (!parser->incomplete_timer_active ||
+      ((uint32_t)(now_ms - parser->incomplete_started_ms) <
+       COMM_PROTOCOL_INCOMPLETE_TIMEOUT_MS))
+  {
+    return false;
+  }
+
+  if (parser->count > 0U)
+  {
+    ParserDrop(parser, 1U);
+    parser->stats.discarded_bytes++;
+  }
+  parser->stats.incomplete_timeouts++;
+  parser->incomplete_timer_active = false;
+  return true;
+}
+
+static CommParseResult ProcessBuffered(CommParser *parser,
+                                       uint32_t now_ms,
+                                       CommFrame *completed_frame)
+{
+  CommParseResult last_error = COMM_PARSE_NONE;
+
+  (void)ExpireIncompleteCandidate(parser, now_ms);
+
+  for (;;)
+  {
+    uint8_t payload_length;
+    uint16_t frame_length;
+    uint16_t calculated_crc;
+    uint16_t received_crc;
+
+    while (parser->count > 0U)
+    {
+      if (ParserPeek(parser, 0U) != COMM_PROTOCOL_SOF1)
+      {
+        ParserDrop(parser, 1U);
+        parser->stats.discarded_bytes++;
+        parser->incomplete_timer_active = false;
+        continue;
+      }
+
+      if (parser->count == 1U)
+      {
+        MarkIncomplete(parser, now_ms);
+        return last_error;
+      }
+
+      if (ParserPeek(parser, 1U) == COMM_PROTOCOL_SOF2)
+      {
+        break;
+      }
+
+      ParserDrop(parser, 1U);
+      parser->stats.discarded_bytes++;
+      parser->incomplete_timer_active = false;
+    }
+
+    if (parser->count == 0U)
+    {
+      parser->incomplete_timer_active = false;
+      return last_error;
+    }
+
+    if (parser->count < 6U)
+    {
+      MarkIncomplete(parser, now_ms);
+      return last_error;
+    }
+
+    if (ParserPeek(parser, 2U) != COMM_PROTOCOL_VERSION)
+    {
+      parser->stats.version_errors++;
+      ParserDrop(parser, 1U);
+      parser->stats.discarded_bytes++;
+      parser->incomplete_timer_active = false;
+      last_error = COMM_PARSE_VERSION_ERROR;
+      continue;
+    }
+
+    payload_length = ParserPeek(parser, 5U);
+    if (payload_length > COMM_PROTOCOL_MAX_PAYLOAD)
+    {
+      parser->stats.length_errors++;
+      ParserDrop(parser, 1U);
+      parser->stats.discarded_bytes++;
+      parser->incomplete_timer_active = false;
+      last_error = COMM_PARSE_LENGTH_ERROR;
+      continue;
+    }
+
+    frame_length =
+        (uint16_t)(COMM_PROTOCOL_FRAME_OVERHEAD + payload_length);
+    if (parser->count < frame_length)
+    {
+      MarkIncomplete(parser, now_ms);
+      return last_error;
+    }
+
+    calculated_crc = 0xFFFFU;
+    for (uint16_t offset = 2U;
+         offset < (uint16_t)(6U + payload_length);
+         offset++)
+    {
+      calculated_crc = CrcUpdate(calculated_crc,
+                                 ParserPeek(parser, offset));
+    }
+    received_crc =
+        (uint16_t)ParserPeek(parser, (uint16_t)(6U + payload_length)) |
+        ((uint16_t)ParserPeek(parser,
+                             (uint16_t)(7U + payload_length)) << 8);
+
+    if (received_crc != calculated_crc)
+    {
+      parser->stats.crc_errors++;
+      ParserDrop(parser, 1U);
+      parser->stats.discarded_bytes++;
+      parser->incomplete_timer_active = false;
+      last_error = COMM_PARSE_CRC_ERROR;
+      continue;
+    }
+
+    if (completed_frame != NULL)
+    {
+      completed_frame->version = ParserPeek(parser, 2U);
+      completed_frame->message_id = ParserPeek(parser, 3U);
+      completed_frame->sequence = ParserPeek(parser, 4U);
+      completed_frame->payload_length = payload_length;
+      for (uint8_t index = 0U; index < payload_length; index++)
+      {
+        completed_frame->payload[index] =
+            ParserPeek(parser, (uint16_t)(6U + index));
+      }
+    }
+
+    ParserDrop(parser, frame_length);
+    parser->incomplete_timer_active = false;
+    parser->stats.valid_frames++;
+    return COMM_PARSE_FRAME_READY;
+  }
 }
 
 void CommProtocol_ParserInit(CommParser *parser)
 {
+  if (parser != NULL)
+  {
+    memset(parser, 0, sizeof(*parser));
+  }
+}
+
+CommParseResult CommProtocol_ParserPushTimed(CommParser *parser,
+                                             uint8_t byte,
+                                             uint32_t now_ms,
+                                             CommFrame *completed_frame)
+{
   if (parser == NULL)
   {
-    return;
+    return COMM_PARSE_NONE;
   }
 
-  memset(parser, 0, sizeof(*parser));
-  ResetForNextFrame(parser);
+  ParserAppend(parser, byte);
+  return ProcessBuffered(parser, now_ms, completed_frame);
 }
 
 CommParseResult CommProtocol_ParserPush(CommParser *parser,
                                         uint8_t byte,
                                         CommFrame *completed_frame)
 {
-  CommParseResult result = COMM_PARSE_NONE;
+  return CommProtocol_ParserPushTimed(parser, byte, 0U, completed_frame);
+}
 
+CommParseResult CommProtocol_ParserPoll(CommParser *parser,
+                                        uint32_t now_ms,
+                                        CommFrame *completed_frame)
+{
   if (parser == NULL)
   {
     return COMM_PARSE_NONE;
   }
 
-  switch (parser->state)
-  {
-    case PARSER_WAIT_SOF1:
-      if (byte == COMM_PROTOCOL_SOF1)
-      {
-        parser->state = PARSER_WAIT_SOF2;
-      }
-      else
-      {
-        parser->stats.discarded_bytes++;
-      }
-      break;
-
-    case PARSER_WAIT_SOF2:
-      if (byte == COMM_PROTOCOL_SOF2)
-      {
-        parser->state = PARSER_READ_VERSION;
-        parser->calculated_crc = 0xFFFFU;
-      }
-      else if (byte != COMM_PROTOCOL_SOF1)
-      {
-        parser->stats.discarded_bytes++;
-        parser->state = PARSER_WAIT_SOF1;
-      }
-      break;
-
-    case PARSER_READ_VERSION:
-      parser->frame.version = byte;
-      parser->calculated_crc = CrcUpdate(parser->calculated_crc, byte);
-      parser->state = PARSER_READ_MESSAGE_ID;
-      break;
-
-    case PARSER_READ_MESSAGE_ID:
-      parser->frame.message_id = byte;
-      parser->calculated_crc = CrcUpdate(parser->calculated_crc, byte);
-      parser->state = PARSER_READ_SEQUENCE;
-      break;
-
-    case PARSER_READ_SEQUENCE:
-      parser->frame.sequence = byte;
-      parser->calculated_crc = CrcUpdate(parser->calculated_crc, byte);
-      parser->state = PARSER_READ_LENGTH;
-      break;
-
-    case PARSER_READ_LENGTH:
-      parser->frame.payload_length = byte;
-      parser->calculated_crc = CrcUpdate(parser->calculated_crc, byte);
-      parser->payload_index = 0U;
-
-      if (byte > COMM_PROTOCOL_MAX_PAYLOAD)
-      {
-        parser->stats.length_errors++;
-        ResetForNextFrame(parser);
-        result = COMM_PARSE_LENGTH_ERROR;
-      }
-      else if (byte == 0U)
-      {
-        parser->state = PARSER_READ_CRC_LOW;
-      }
-      else
-      {
-        parser->state = PARSER_READ_PAYLOAD;
-      }
-      break;
-
-    case PARSER_READ_PAYLOAD:
-      parser->frame.payload[parser->payload_index] = byte;
-      parser->payload_index++;
-      parser->calculated_crc = CrcUpdate(parser->calculated_crc, byte);
-
-      if (parser->payload_index >= parser->frame.payload_length)
-      {
-        parser->state = PARSER_READ_CRC_LOW;
-      }
-      break;
-
-    case PARSER_READ_CRC_LOW:
-      parser->received_crc = byte;
-      parser->state = PARSER_READ_CRC_HIGH;
-      break;
-
-    case PARSER_READ_CRC_HIGH:
-      parser->received_crc |= (uint16_t)byte << 8;
-
-      if (parser->received_crc != parser->calculated_crc)
-      {
-        parser->stats.crc_errors++;
-        result = COMM_PARSE_CRC_ERROR;
-      }
-      else if (parser->frame.version != COMM_PROTOCOL_VERSION)
-      {
-        parser->stats.version_errors++;
-        result = COMM_PARSE_VERSION_ERROR;
-      }
-      else
-      {
-        parser->stats.valid_frames++;
-        if (completed_frame != NULL)
-        {
-          *completed_frame = parser->frame;
-        }
-        result = COMM_PARSE_FRAME_READY;
-      }
-
-      ResetForNextFrame(parser);
-      break;
-
-    default:
-      ResetForNextFrame(parser);
-      break;
-  }
-
-  return result;
+  return ProcessBuffered(parser, now_ms, completed_frame);
 }
 
 uint16_t CommProtocol_Crc16CcittFalse(const uint8_t *data, size_t length)

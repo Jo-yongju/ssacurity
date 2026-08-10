@@ -1,6 +1,10 @@
 #ifndef APP_PID_H
 #define APP_PID_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdbool.h>
 
 typedef struct
@@ -30,5 +34,9 @@ float PID_Update(PIDController *pid,
                  float target,
                  float measurement,
                  float dt_seconds);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
