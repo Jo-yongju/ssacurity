@@ -59,10 +59,6 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define BTS_R_EN_Pin GPIO_PIN_2
-#define BTS_R_EN_GPIO_Port GPIOE
-#define BTS_L_EN_Pin GPIO_PIN_3
-#define BTS_L_EN_GPIO_Port GPIOE
 #define PC14_OSC32_IN_Pin GPIO_PIN_14
 #define PC14_OSC32_IN_GPIO_Port GPIOC
 #define PC15_OSC32_OUT_Pin GPIO_PIN_15
@@ -79,6 +75,8 @@ void Error_Handler(void);
 #define A4_GPIO_Port GPIOF
 #define A5_Pin GPIO_PIN_5
 #define A5_GPIO_Port GPIOF
+#define BNO085_CS_Pin GPIO_PIN_6
+#define BNO085_CS_GPIO_Port GPIOF
 #define SPI5_SCK_Pin GPIO_PIN_7
 #define SPI5_SCK_GPIO_Port GPIOF
 #define SPI5_MISO_Pin GPIO_PIN_8
@@ -99,10 +97,16 @@ void Error_Handler(void);
 #define CSX_GPIO_Port GPIOC
 #define MEMS_INT2_Pin GPIO_PIN_2
 #define MEMS_INT2_GPIO_Port GPIOA
+#define ULTRASONIC_ECHO_Pin GPIO_PIN_3
+#define ULTRASONIC_ECHO_GPIO_Port GPIOB
+#define ULTRASONIC_TRIG_Pin GPIO_PIN_5
+#define ULTRASONIC_TRIG_GPIO_Port GPIOA
+#define STEERING_ANGLE_Pin GPIO_PIN_3
+#define STEERING_ANGLE_GPIO_Port GPIOC
+#define BTS_LPWM_Pin GPIO_PIN_3
+#define BTS_LPWM_GPIO_Port GPIOA
 #define VSYNC_Pin GPIO_PIN_4
 #define VSYNC_GPIO_Port GPIOA
-#define G2_Pin GPIO_PIN_6
-#define G2_GPIO_Port GPIOA
 #define ACP_RST_Pin GPIO_PIN_7
 #define ACP_RST_GPIO_Port GPIOA
 #define OTG_FS_PSO_Pin GPIO_PIN_4
@@ -129,6 +133,11 @@ void Error_Handler(void);
 #define A10_GPIO_Port GPIOG
 #define A11_Pin GPIO_PIN_1
 #define A11_GPIO_Port GPIOG
+#define BNO085_RST_Pin GPIO_PIN_2
+#define BNO085_RST_GPIO_Port GPIOG
+#define BNO085_INT_Pin GPIO_PIN_3
+#define BNO085_INT_GPIO_Port GPIOG
+#define BNO085_INT_EXTI_IRQn EXTI3_IRQn
 #define D4_Pin GPIO_PIN_7
 #define D4_GPIO_Port GPIOE
 #define D5_Pin GPIO_PIN_8
@@ -175,8 +184,12 @@ void Error_Handler(void);
 #define D0_GPIO_Port GPIOD
 #define D1_Pin GPIO_PIN_15
 #define D1_GPIO_Port GPIOD
+#define BA0_Pin GPIO_PIN_4
+#define BA0_GPIO_Port GPIOG
 #define BA1_Pin GPIO_PIN_5
 #define BA1_GPIO_Port GPIOG
+#define R7_Pin GPIO_PIN_6
+#define R7_GPIO_Port GPIOG
 #define DOTCLK_Pin GPIO_PIN_7
 #define DOTCLK_GPIO_Port GPIOG
 #define SDCLK_Pin GPIO_PIN_8
@@ -227,6 +240,10 @@ void Error_Handler(void);
 #define SDNCAS_GPIO_Port GPIOG
 #define SDCKE1_Pin GPIO_PIN_5
 #define SDCKE1_GPIO_Port GPIOB
+#define ENCODER_A_Pin GPIO_PIN_6
+#define ENCODER_A_GPIO_Port GPIOB
+#define ENCODER_B_Pin GPIO_PIN_7
+#define ENCODER_B_GPIO_Port GPIOB
 #define B6_Pin GPIO_PIN_8
 #define B6_GPIO_Port GPIOB
 #define B7_Pin GPIO_PIN_9
@@ -235,6 +252,10 @@ void Error_Handler(void);
 #define NBL0_GPIO_Port GPIOE
 #define NBL1_Pin GPIO_PIN_1
 #define NBL1_GPIO_Port GPIOE
+#define BTS_R_EN_Pin GPIO_PIN_2
+#define BTS_R_EN_GPIO_Port GPIOE
+#define BTS_L_EN_Pin GPIO_PIN_3
+#define BTS_L_EN_GPIO_Port GPIOE
 
 /* USER CODE BEGIN Private defines */
 
