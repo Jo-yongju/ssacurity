@@ -1,71 +1,243 @@
-/*
-  motor.c
- */
-
-#define ABS(x) (((x) >= 0) ? (x) : -(x))
-
-
 #include "motor.h"
+
+#include "main.h"
+
+#include <stdint.h>
+
 extern TIM_HandleTypeDef htim5;
 
+#define MOTOR_FORWARD_CHANNEL TIM_CHANNEL_1
+#define MOTOR_REVERSE_CHANNEL TIM_CHANNEL_4
+#define MOTOR_MIN_PERCENT     (-100.0f)
+#define MOTOR_MAX_PERCENT     100.0f
 
-//초기화 함수
-/*
- 1. BTS_R_EN, BTS_L_EN을 Low
-2. TIM5 PWM Channel 1 시작
-3. TIM5 PWM Channel 2 시작
-4. 두 PWM Compare 값을 0으로 설정
-5. BTS_R_EN, BTS_L_EN을 High
- */
+static bool motor_initialized;
+static bool motor_enabled;
+static bool motor_emergency_disabled;
+static bool motor_direction_inverted;
+static float motor_applied_percent;
 
-void DriveMotor_Init(void)
+static uint32_t LockMotorState(void)
 {
-    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_2, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_RESET);
+  uint32_t primask = __get_PRIMASK();
 
-
-    HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_4);
-
-    TIM5->CCR1 = 0;
-    TIM5->CCR4 = 0;
-
-
-    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_2, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_SET);
-
+  __disable_irq();
+  return primask;
 }
 
-
-//
-/*
- 1. 입력값을 -100~100으로 제한
-2. PWM 절댓값을 CCR 값으로 변환
-3. 양수이면 CH1만 출력, CH2는 0
-4. 음수이면 CH1은 0, CH2만 출력
-5. 0이면 CH1과 CH2 모두 0
- */
-void Motor_SetPWM(float pwm_percent)
+static void UnlockMotorState(uint32_t primask)
 {
-	if(pwm_percent < -100){
-		pwm_percent = -100;
-	}
-	if(pwm_percent > 100){
-		pwm_percent = 100;
-	}
+  __set_PRIMASK(primask);
+}
 
-	uint32_t ccr = (uint32_t)(ABS(pwm_percent) * TIM5->ARR / 100.0f);//
+static float ClampPercent(float percent)
+{
+  if (percent > MOTOR_MAX_PERCENT)
+  {
+    return MOTOR_MAX_PERCENT;
+  }
 
-	if(pwm_percent > 0){
-		TIM5->CCR4 = 0;
-		TIM5->CCR1 = ccr;
-	}
-	else if(pwm_percent < 0){
-		TIM5->CCR1 = 0;
-		TIM5->CCR4 = ccr;
-	}
-	else{
-		TIM5->CCR1 = 0;
-		TIM5->CCR4 = 0;
-	}
+  if (percent < MOTOR_MIN_PERCENT)
+  {
+    return MOTOR_MIN_PERCENT;
+  }
+
+  return percent;
+}
+
+static uint32_t PercentToCompare(TIM_HandleTypeDef *timer,
+                                 float magnitude_percent)
+{
+  uint32_t period_counts = __HAL_TIM_GET_AUTORELOAD(timer) + 1U;
+  float compare = (magnitude_percent * (float)period_counts) / 100.0f;
+
+  if (compare <= 0.0f)
+  {
+    return 0U;
+  }
+
+  if (compare >= (float)period_counts)
+  {
+    return period_counts;
+  }
+
+  return (uint32_t)(compare + 0.5f);
+}
+
+static void SetBothPwmChannelsToZero(void)
+{
+  __HAL_TIM_SET_COMPARE(&htim5, MOTOR_FORWARD_CHANNEL, 0U);
+  __HAL_TIM_SET_COMPARE(&htim5, MOTOR_REVERSE_CHANNEL, 0U);
+}
+
+bool Motor_Init(void)
+{
+  bool emergency_disabled = motor_emergency_disabled;
+
+  HAL_GPIO_WritePin(BTS_R_EN_GPIO_Port,
+                    BTS_R_EN_Pin | BTS_L_EN_Pin,
+                    GPIO_PIN_RESET);
+  SetBothPwmChannelsToZero();
+
+  if (HAL_TIM_PWM_Start(&htim5, MOTOR_FORWARD_CHANNEL) != HAL_OK)
+  {
+    return false;
+  }
+
+  if (HAL_TIM_PWM_Start(&htim5, MOTOR_REVERSE_CHANNEL) != HAL_OK)
+  {
+    (void)HAL_TIM_PWM_Stop(&htim5, MOTOR_FORWARD_CHANNEL);
+    return false;
+  }
+
+  motor_initialized = true;
+  motor_enabled = false;
+  motor_emergency_disabled = emergency_disabled;
+  motor_applied_percent = 0.0f;
+  return true;
+}
+
+void Motor_Enable(void)
+{
+  uint32_t primask = LockMotorState();
+
+  if (!motor_initialized || motor_emergency_disabled)
+  {
+    UnlockMotorState(primask);
+    return;
+  }
+
+  HAL_GPIO_WritePin(BTS_R_EN_GPIO_Port,
+                    BTS_R_EN_Pin | BTS_L_EN_Pin,
+                    GPIO_PIN_SET);
+  motor_enabled = true;
+  UnlockMotorState(primask);
+}
+
+void Motor_Disable(void)
+{
+  uint32_t primask = LockMotorState();
+
+  SetBothPwmChannelsToZero();
+  HAL_GPIO_WritePin(BTS_R_EN_GPIO_Port,
+                    BTS_R_EN_Pin | BTS_L_EN_Pin,
+                    GPIO_PIN_RESET);
+  motor_enabled = false;
+  motor_applied_percent = 0.0f;
+  UnlockMotorState(primask);
+}
+
+bool Motor_IsEnabled(void)
+{
+  bool enabled;
+  uint32_t primask = LockMotorState();
+
+  enabled = motor_enabled;
+  UnlockMotorState(primask);
+  return enabled;
+}
+
+void Motor_EmergencyDisable(void)
+{
+  uint32_t primask = LockMotorState();
+
+  motor_emergency_disabled = true;
+  SetBothPwmChannelsToZero();
+  HAL_GPIO_WritePin(BTS_R_EN_GPIO_Port,
+                    BTS_R_EN_Pin | BTS_L_EN_Pin,
+                    GPIO_PIN_RESET);
+  motor_enabled = false;
+  motor_applied_percent = 0.0f;
+  UnlockMotorState(primask);
+}
+
+bool Motor_ClearEmergencyDisable(void)
+{
+  bool cleared = false;
+  uint32_t primask = LockMotorState();
+
+  SetBothPwmChannelsToZero();
+  HAL_GPIO_WritePin(BTS_R_EN_GPIO_Port,
+                    BTS_R_EN_Pin | BTS_L_EN_Pin,
+                    GPIO_PIN_RESET);
+  motor_enabled = false;
+  motor_applied_percent = 0.0f;
+
+  if (motor_initialized)
+  {
+    motor_emergency_disabled = false;
+    cleared = true;
+  }
+
+  UnlockMotorState(primask);
+  return cleared;
+}
+
+bool Motor_IsEmergencyDisabled(void)
+{
+  bool emergency_disabled;
+  uint32_t primask = LockMotorState();
+
+  emergency_disabled = motor_emergency_disabled;
+  UnlockMotorState(primask);
+  return emergency_disabled;
+}
+
+void Motor_SetPercent(float percent)
+{
+  float requested_percent;
+  float magnitude_percent;
+  uint32_t compare;
+  uint32_t primask = LockMotorState();
+
+  if (!motor_initialized || !motor_enabled || motor_emergency_disabled)
+  {
+    SetBothPwmChannelsToZero();
+    motor_applied_percent = 0.0f;
+    UnlockMotorState(primask);
+    return;
+  }
+
+  requested_percent = ClampPercent(percent);
+  if (motor_direction_inverted)
+  {
+    requested_percent = -requested_percent;
+  }
+
+  /* Never leave forward and reverse PWM active at the same time. */
+  SetBothPwmChannelsToZero();
+
+  if (requested_percent > 0.0f)
+  {
+    compare = PercentToCompare(&htim5, requested_percent);
+    __HAL_TIM_SET_COMPARE(&htim5, MOTOR_FORWARD_CHANNEL, compare);
+  }
+  else if (requested_percent < 0.0f)
+  {
+    magnitude_percent = -requested_percent;
+    compare = PercentToCompare(&htim5, magnitude_percent);
+    __HAL_TIM_SET_COMPARE(&htim5, MOTOR_REVERSE_CHANNEL, compare);
+  }
+
+  motor_applied_percent =
+      motor_direction_inverted ? -requested_percent : requested_percent;
+  UnlockMotorState(primask);
+}
+
+float Motor_GetAppliedPercent(void)
+{
+  float applied_percent;
+  uint32_t primask = LockMotorState();
+
+  applied_percent = motor_applied_percent;
+  UnlockMotorState(primask);
+  return applied_percent;
+}
+
+void Motor_SetDirectionInverted(bool inverted)
+{
+  uint32_t primask = LockMotorState();
+
+  motor_direction_inverted = inverted;
+  UnlockMotorState(primask);
 }
