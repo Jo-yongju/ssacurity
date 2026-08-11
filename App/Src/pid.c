@@ -103,6 +103,8 @@ float PID_Update(PIDController *pid,
                        (pid->kd * derivative);
   output = ClampOutput(pid, unsaturated_output);
 
+#if PID_ANTI_WINDUP_ENABLED
+
   /*
    * Conditional integration prevents the integral term from winding up while
    * the output is saturated, but allows it to unwind toward the valid range.
@@ -113,6 +115,16 @@ float PID_Update(PIDController *pid,
   {
     pid->integral = integral_candidate;
   }
+
+#else
+
+  /*
+   * Experimental anti-windup OFF: keep integrating regardless of output
+   * saturation.
+   */
+  pid->integral = integral_candidate;
+
+#endif
 
   pid->previous_error = error;
   pid->previous_error_valid = true;

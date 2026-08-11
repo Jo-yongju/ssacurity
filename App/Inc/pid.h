@@ -1,6 +1,10 @@
 #ifndef APP_PID_H
 #define APP_PID_H
 
+#ifndef PID_ANTI_WINDUP_ENABLED
+#define PID_ANTI_WINDUP_ENABLED 1
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
