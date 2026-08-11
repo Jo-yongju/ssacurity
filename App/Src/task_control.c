@@ -11,6 +11,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
+#include <math.h>
 #include <string.h>
 
 #define CONTROL_PERIOD_MS          10U
@@ -22,6 +23,8 @@
 #define CONTROL_PID_KD             0.0f
 #define CONTROL_MIN_RUNNING_PWM    22.0f
 #define CONTROL_MAX_RUNNING_PWM    95.0f
+#define CONTROL_FF_OFFSET_PWM       18.5f
+#define CONTROL_FF_GAIN_PWM_PER_MPS 46.5f
 #define CONTROL_SAFETY_TIMEOUT_MS  50U
 #define CONTROL_SERVO_DIAGNOSTIC_TIMEOUT_MS 300U
 #define CONTROL_PID_OUTPUT_MIN     \
@@ -121,21 +124,40 @@ static float EncoderSpeedWindow_Update(EncoderSpeedWindow *window,
   return window->total_distance_m / elapsed_seconds;
 }
 
+static float CalculateSpeedFeedforwardMagnitude(float target_speed_mps)
+{
+  float feedforward_pwm =
+      CONTROL_FF_OFFSET_PWM +
+      (CONTROL_FF_GAIN_PWM_PER_MPS * fabsf(target_speed_mps));
+
+  /*
+   * Initial fit from closed-loop vehicle test data. Re-tune these constants
+   * after validating the feed-forward response on the vehicle.
+   */
+  if (feedforward_pwm < CONTROL_MIN_RUNNING_PWM)
+  {
+    return CONTROL_MIN_RUNNING_PWM;
+  }
+
+  if (feedforward_pwm > CONTROL_MAX_RUNNING_PWM)
+  {
+    return CONTROL_MAX_RUNNING_PWM;
+  }
+
+  return feedforward_pwm;
+}
+
 static float ApplySpeedFeedforward(float target_speed_mps,
                                    float pid_correction)
 {
+  float feedforward_pwm;
   float output;
 
-  /*
-   * The measured BTS7960/motor dead zone is about 20%. PID output is therefore
-   * used as a correction around a 22% feed-forward term. The current
-   * measured no-load saturation point is 95% duty. Clamp the result to the requested
-   * direction so an overspeed correction cannot command an abrupt reverse
-   * torque.
-   */
   if (target_speed_mps > 0.0f)
   {
-    output = CONTROL_MIN_RUNNING_PWM + pid_correction;
+    feedforward_pwm =
+        CalculateSpeedFeedforwardMagnitude(target_speed_mps);
+    output = feedforward_pwm + pid_correction;
     if (output < 0.0f)
     {
       return 0.0f;
@@ -147,16 +169,23 @@ static float ApplySpeedFeedforward(float target_speed_mps,
     return output;
   }
 
-  output = -CONTROL_MIN_RUNNING_PWM + pid_correction;
-  if (output > 0.0f)
+  if (target_speed_mps < 0.0f)
   {
-    return 0.0f;
+    feedforward_pwm =
+        CalculateSpeedFeedforwardMagnitude(target_speed_mps);
+    output = -feedforward_pwm + pid_correction;
+    if (output > 0.0f)
+    {
+      return 0.0f;
+    }
+    if (output < -CONTROL_MAX_RUNNING_PWM)
+    {
+      return -CONTROL_MAX_RUNNING_PWM;
+    }
+    return output;
   }
-  if (output < -CONTROL_MAX_RUNNING_PWM)
-  {
-    return -CONTROL_MAX_RUNNING_PWM;
-  }
-  return output;
+
+  return 0.0f;
 }
 
 static void CopyCommand(ControlCommand *command)
