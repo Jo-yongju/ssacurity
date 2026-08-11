@@ -15,6 +15,8 @@
 
 #define CONTROL_PERIOD_MS          10U
 #define CONTROL_PERIOD_SECONDS     0.010f
+#define CONTROL_SPEED_WINDOW_SIZE  5U
+#define CONTROL_SPEED_WINDOW_SECONDS 0.050f
 #define CONTROL_PID_KP             120.0f
 #define CONTROL_PID_KI             20.0f
 #define CONTROL_PID_KD             0.0f
@@ -28,12 +30,21 @@
   (CONTROL_MAX_RUNNING_PWM - CONTROL_MIN_RUNNING_PWM)
 #define CONTROL_ZERO_SPEED_EPSILON 0.001f
 
+typedef struct
+{
+  float delta_distance_m[CONTROL_SPEED_WINDOW_SIZE];
+  float total_distance_m;
+  uint32_t next_index;
+  uint32_t sample_count;
+} EncoderSpeedWindow;
+
 static ControlCommand shared_command;
 static ControlState shared_state;
 static SafetyRequest shared_safety_request;
 static osMutexId_t safety_request_mutex;
 static uint32_t latched_fault_flags;
 static PIDController speed_pid;
+static EncoderSpeedWindow encoder_speed_window;
 static uint16_t shared_servo_diagnostic_pulse_us;
 static uint32_t shared_servo_diagnostic_updated_at_ms;
 
@@ -75,6 +86,39 @@ static bool IsNearlyZero(float value)
 {
   return (value > -CONTROL_ZERO_SPEED_EPSILON) &&
          (value < CONTROL_ZERO_SPEED_EPSILON);
+}
+
+static void EncoderSpeedWindow_Reset(EncoderSpeedWindow *window)
+{
+  memset(window, 0, sizeof(*window));
+}
+
+static float EncoderSpeedWindow_Update(EncoderSpeedWindow *window,
+                                       float delta_distance_m)
+{
+  float elapsed_seconds;
+
+  if (window->sample_count == CONTROL_SPEED_WINDOW_SIZE)
+  {
+    window->total_distance_m -=
+        window->delta_distance_m[window->next_index];
+  }
+  else
+  {
+    window->sample_count++;
+  }
+
+  window->delta_distance_m[window->next_index] = delta_distance_m;
+  window->total_distance_m += delta_distance_m;
+  window->next_index =
+      (window->next_index + 1U) % CONTROL_SPEED_WINDOW_SIZE;
+
+  elapsed_seconds =
+      (window->sample_count == CONTROL_SPEED_WINDOW_SIZE) ?
+          CONTROL_SPEED_WINDOW_SECONDS :
+          ((float)window->sample_count * CONTROL_PERIOD_SECONDS);
+
+  return window->total_distance_m / elapsed_seconds;
 }
 
 static float ApplySpeedFeedforward(float target_speed_mps,
@@ -170,6 +214,7 @@ void Control_Init(void)
   shared_servo_diagnostic_pulse_us = 0U;
   shared_servo_diagnostic_updated_at_ms = 0U;
   latched_fault_flags = CONTROL_FAULT_NONE;
+  EncoderSpeedWindow_Reset(&encoder_speed_window);
 
   safety_request_mutex = osMutexNew(&mutex_attributes);
   if (safety_request_mutex == NULL)
@@ -240,6 +285,7 @@ void Control_Task(void *argument)
   for (;;)
   {
     float applied_pwm = 0.0f;
+    float measured_speed_mps;
     uint32_t active_faults;
     bool safety_request_stale;
     bool steering_read_ok;
@@ -247,6 +293,7 @@ void Control_Task(void *argument)
     bool steering_servo_calibrated;
     bool steering_servo_command_ok;
     bool servo_diagnostic_active;
+    bool reset_speed_window = false;
     uint16_t servo_diagnostic_pulse_us;
     uint32_t servo_diagnostic_updated_at_ms;
 
@@ -255,6 +302,9 @@ void Control_Task(void *argument)
     taskEXIT_CRITICAL();
 
     Encoder_Update(CONTROL_PERIOD_SECONDS, &encoder_sample);
+    measured_speed_mps =
+        EncoderSpeedWindow_Update(&encoder_speed_window,
+                                  encoder_sample.delta_distance_m);
     steering_read_ok = SteeringSensor_Read(&steering_sample);
     CopyCommand(&command);
     CopySafetyRequest(&safety_request);
@@ -375,6 +425,7 @@ void Control_Task(void *argument)
 
     if ((active_faults & CONTROL_FAULT_HARDWARE_INIT) != 0U)
     {
+      reset_speed_window = true;
       Motor_Disable();
       command.mode = CONTROL_MODE_DISABLED;
     }
@@ -384,6 +435,7 @@ void Control_Task(void *argument)
                 CONTROL_FAULT_STEERING_SENSOR_INVALID |
                 CONTROL_FAULT_STEERING_SERVO_INVALID)) != 0U))
     {
+      reset_speed_window = true;
       PID_Reset(&speed_pid);
       Motor_Disable();
     }
@@ -391,6 +443,7 @@ void Control_Task(void *argument)
              safety_request.latched ||
              safety_request_stale)
     {
+      reset_speed_window = true;
       PID_Reset(&speed_pid);
       if (safety_request.latched)
       {
@@ -406,6 +459,7 @@ void Control_Task(void *argument)
       switch (command.mode)
       {
         case CONTROL_MODE_OPEN_LOOP:
+          reset_speed_window = IsNearlyZero(command.pwm_percent);
           Motor_Enable();
           applied_pwm = ClampPercent(command.pwm_percent);
           Motor_SetPercent(applied_pwm);
@@ -414,12 +468,14 @@ void Control_Task(void *argument)
         case CONTROL_MODE_SPEED_PID:
           if (!encoder_sample.calibrated)
           {
+            reset_speed_window = true;
             active_faults |= CONTROL_FAULT_ENCODER_NOT_CALIBRATED;
             PID_Reset(&speed_pid);
             Motor_Disable();
           }
           else if (IsNearlyZero(command.target_speed_mps))
           {
+            reset_speed_window = true;
             PID_Reset(&speed_pid);
             Motor_Enable();
             Motor_SetPercent(0.0f);
@@ -431,7 +487,7 @@ void Control_Task(void *argument)
             active_faults &= ~CONTROL_FAULT_ENCODER_NOT_CALIBRATED;
             pid_correction = PID_Update(&speed_pid,
                                         command.target_speed_mps,
-                                        encoder_sample.speed_mps,
+                                        measured_speed_mps,
                                         CONTROL_PERIOD_SECONDS);
             applied_pwm = ApplySpeedFeedforward(command.target_speed_mps,
                                                 pid_correction);
@@ -442,10 +498,17 @@ void Control_Task(void *argument)
 
         case CONTROL_MODE_DISABLED:
         default:
+          reset_speed_window = true;
           PID_Reset(&speed_pid);
           Motor_Disable();
           break;
       }
+    }
+
+    if (reset_speed_window)
+    {
+      EncoderSpeedWindow_Reset(&encoder_speed_window);
+      measured_speed_mps = 0.0f;
     }
 
     state.mode = command.mode;
@@ -457,7 +520,7 @@ void Control_Task(void *argument)
         encoder_sample.delta_distance_m;
     state.encoder_total_distance_m =
         encoder_sample.total_distance_m;
-    state.measured_speed_mps = encoder_sample.speed_mps;
+    state.measured_speed_mps = measured_speed_mps;
     state.steering_adc_raw = steering_sample.raw;
     state.measured_steering_deg = steering_sample.angle_deg;
     state.steering_adc_valid =
