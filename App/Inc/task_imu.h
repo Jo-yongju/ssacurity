@@ -60,6 +60,7 @@ bool ImuTask_Init(SPI_HandleTypeDef *spi);
 void Imu_Task(void *argument);
 void ImuTask_GetState(ImuState *state);
 bool ImuTask_IsFusionReady(const ImuState *state, uint32_t now_ms);
+bool ImuTask_IsHeadingReady(const ImuState *state, uint32_t now_ms);
 
 /* Called by HAL_GPIO_EXTI_Callback; no SPI transaction occurs in the ISR. */
 void ImuTask_OnDataReadyInterrupt(void);

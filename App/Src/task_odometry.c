@@ -54,7 +54,7 @@ void Odometry_Task(void *argument)
     ControlState control_state;
     ImuState imu_state;
     float delta_distance_m = 0.0f;
-    bool imu_fusion_valid;
+    bool imu_heading_valid;
     uint32_t now_ms;
 
     memset(&control_state, 0, sizeof(control_state));
@@ -62,10 +62,7 @@ void Odometry_Task(void *argument)
     Control_GetState(&control_state);
     ImuTask_GetState(&imu_state);
     now_ms = osKernelGetTickCount();
-    imu_fusion_valid =
-        ImuTask_IsFusionReady(&imu_state, now_ms) &&
-        (fabsf(control_state.measured_speed_mps) >=
-         VEHICLE_IMU_FUSION_MIN_SPEED_MPS);
+    imu_heading_valid = ImuTask_IsHeadingReady(&imu_state, now_ms);
 
     if (control_state.encoder_calibrated)
     {
@@ -88,7 +85,7 @@ void Odometry_Task(void *argument)
     {
       if (control_state.steering_angle_valid)
       {
-        (void)Odometry_UpdateFused(
+        (void)Odometry_UpdateWithHeading(
             &odometry_context,
             delta_distance_m,
             control_state.measured_speed_mps,
@@ -96,9 +93,10 @@ void Odometry_Task(void *argument)
             control_state.encoder_calibrated,
             ODOMETRY_TASK_PERIOD_SECONDS,
             now_ms,
-            imu_fusion_valid,
-            imu_state.gyro_z_rad_s,
-            VEHICLE_IMU_FUSION_WEIGHT);
+            imu_heading_valid,
+            imu_state.yaw_rad,
+            (OdometryHeadingMode)VEHICLE_ODOMETRY_HEADING_MODE,
+            VEHICLE_IMU_HEADING_CORRECTION_WEIGHT);
       }
 #if VEHICLE_ALLOW_STEERING_COMMAND_ESTIMATE
       else
@@ -108,7 +106,7 @@ void Odometry_Task(void *argument)
          * angles. Integrate the commanded angle directly and mark the
          * resulting pose as steering-estimated.
          */
-        (void)Odometry_UpdateFromCenterSteeringFused(
+        (void)Odometry_UpdateFromCenterSteeringWithHeading(
             &odometry_context,
             delta_distance_m,
             control_state.measured_speed_mps,
@@ -117,9 +115,10 @@ void Odometry_Task(void *argument)
                 control_state.steering_servo_calibrated,
             ODOMETRY_TASK_PERIOD_SECONDS,
             now_ms,
-            imu_fusion_valid,
-            imu_state.gyro_z_rad_s,
-            VEHICLE_IMU_FUSION_WEIGHT);
+            imu_heading_valid,
+            imu_state.yaw_rad,
+            (OdometryHeadingMode)VEHICLE_ODOMETRY_HEADING_MODE,
+            VEHICLE_IMU_HEADING_CORRECTION_WEIGHT);
       }
 #else
       else

@@ -189,7 +189,7 @@ static uint32_t ControlFaultsToCommFaults(
   }
 
   if ((imu_state == NULL) ||
-      !ImuTask_IsFusionReady(imu_state, HAL_GetTick()))
+      !ImuTask_IsHeadingReady(imu_state, HAL_GetTick()))
   {
     /* Report-only degradation: odometry automatically falls back to Ackermann. */
     comm_faults |= COMM_FAULT_IMU_LOST;
@@ -506,7 +506,7 @@ static void SendTelemetryIfDue(void)
           0;
   telemetry.encoder_count =
       Int64ToInt32Saturated(control_state.encoder_total_count);
-  telemetry.yaw_cdeg = odometry_state.imu_fused ?
+  telemetry.yaw_cdeg = odometry_state.update_valid ?
       FloatToInt16Saturated(
           odometry_state.yaw_rad * ODOMETRY_RAD_TO_CDEG) :
       0;
@@ -659,6 +659,12 @@ static void SendTelemetryIfDue(void)
   if (odometry_state.imu_fused)
   {
     odometry.status_flags |= COMM_ODOMETRY_STATUS_IMU_FUSED;
+  }
+  if ((odometry_state.status_flags &
+       ODOMETRY_STATUS_IMU_HEADING_FALLBACK) != 0U)
+  {
+    odometry.status_flags |=
+        COMM_ODOMETRY_STATUS_IMU_HEADING_FALLBACK;
   }
   if ((odometry_state.status_flags &
        (ODOMETRY_STATUS_GEOMETRY_INVALID |
