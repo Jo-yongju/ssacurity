@@ -207,6 +207,24 @@ bool ImuTask_IsFusionReady(const ImuState *state, uint32_t now_ms)
          (fabsf(state->gyro_z_rad_s) <= VEHICLE_IMU_MAX_YAW_RATE_RAD_S);
 }
 
+bool ImuTask_IsHeadingReady(const ImuState *state, uint32_t now_ms)
+{
+  if (state == NULL)
+  {
+    return false;
+  }
+
+  return ((state->status_flags &
+           (IMU_STATUS_CONNECTED | IMU_STATUS_QUATERNION_VALID)) ==
+          (IMU_STATUS_CONNECTED | IMU_STATUS_QUATERNION_VALID)) &&
+         ((uint32_t)(now_ms - state->quaternion_updated_at_ms) <=
+          VEHICLE_IMU_STALE_TIMEOUT_MS) &&
+#if VEHICLE_IMU_ENFORCE_ACCURACY_GATE
+         (state->quaternion_accuracy >= VEHICLE_IMU_MIN_FUSION_ACCURACY) &&
+#endif
+         isfinite(state->yaw_rad);
+}
+
 void ImuTask_GetState(ImuState *state)
 {
   uint32_t now;

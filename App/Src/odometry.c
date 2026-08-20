@@ -34,6 +34,7 @@ void Odometry_Init(OdometryContext *context)
 
   memset(context, 0, sizeof(*context));
   context->state.status_flags = ODOMETRY_STATUS_GEOMETRY_INVALID;
+  context->imu_heading_reference_valid = false;
 }
 
 bool Odometry_SetGeometry(OdometryContext *context,
@@ -97,6 +98,7 @@ void Odometry_ResetPose(OdometryContext *context,
   context->state.yaw_rate_rad_s = 0.0f;
   context->state.curvature_per_m = 0.0f;
   context->state.update_valid = false;
+  context->imu_heading_reference_valid = false;
 }
 
 static bool BeginUpdate(OdometryContext *context,
@@ -116,7 +118,9 @@ static bool BeginUpdate(OdometryContext *context,
   context->state.imu_fused = false;
   context->state.updated_at_ms = now_ms;
   context->state.status_flags &=
-      ~(ODOMETRY_STATUS_STEERING_ESTIMATED | ODOMETRY_STATUS_IMU_FUSED);
+      ~(ODOMETRY_STATUS_STEERING_ESTIMATED |
+        ODOMETRY_STATUS_IMU_FUSED |
+        ODOMETRY_STATUS_IMU_HEADING_FALLBACK);
 
   if (!context->geometry.valid)
   {
@@ -157,14 +161,18 @@ static bool IntegrateWithCurvature(
     float curvature,
     bool steering_estimated,
     float dt_seconds,
-    bool imu_yaw_rate_valid,
-    float imu_yaw_rate_rad_s,
-    float imu_weight)
+    bool imu_heading_valid,
+    float imu_yaw_rad,
+    OdometryHeadingMode heading_mode,
+    float heading_correction_weight)
 {
   float model_delta_yaw;
   float delta_yaw;
+  float model_heading;
+  float next_heading;
   float heading_midpoint;
   bool imu_fused = false;
+  bool imu_fallback = false;
 
   if (!isfinite(center_steering_angle_deg) ||
       !isfinite(curvature) ||
@@ -176,27 +184,59 @@ static bool IntegrateWithCurvature(
   }
   context->state.status_flags &= ~ODOMETRY_STATUS_INPUT_INVALID;
 
-  model_delta_yaw = delta_distance_m * curvature;
-  delta_yaw = model_delta_yaw;
-  if (imu_yaw_rate_valid &&
-      isfinite(imu_yaw_rate_rad_s) &&
-      isfinite(imu_weight) &&
-      (imu_weight >= 0.0f) &&
-      (imu_weight <= 1.0f))
+  if ((heading_mode > ODOMETRY_HEADING_IMU_ONLY) ||
+      !isfinite(heading_correction_weight) ||
+      (heading_correction_weight < 0.0f) ||
+      (heading_correction_weight > 1.0f))
   {
-    float imu_delta_yaw = imu_yaw_rate_rad_s * dt_seconds;
+    context->state.status_flags |= ODOMETRY_STATUS_INPUT_INVALID;
+    return false;
+  }
 
-    delta_yaw = ((1.0f - imu_weight) * model_delta_yaw) +
-                (imu_weight * imu_delta_yaw);
+  model_delta_yaw = delta_distance_m * curvature;
+  model_heading =
+      NormalizeYaw(context->state.yaw_rad + model_delta_yaw);
+  next_heading = model_heading;
+
+  if ((heading_mode != ODOMETRY_HEADING_MODEL_ONLY) &&
+      imu_heading_valid && isfinite(imu_yaw_rad))
+  {
+    float imu_heading_aligned;
+
+    if (!context->imu_heading_reference_valid)
+    {
+      context->imu_heading_offset_rad =
+          NormalizeYaw(context->state.yaw_rad - imu_yaw_rad);
+      context->imu_heading_reference_valid = true;
+    }
+    imu_heading_aligned =
+        NormalizeYaw(imu_yaw_rad + context->imu_heading_offset_rad);
+
+    if (heading_mode == ODOMETRY_HEADING_COMPLEMENTARY)
+    {
+      float heading_error =
+          NormalizeYaw(imu_heading_aligned - model_heading);
+      next_heading = NormalizeYaw(
+          model_heading + (heading_correction_weight * heading_error));
+    }
+    else
+    {
+      next_heading = imu_heading_aligned;
+    }
     imu_fused = true;
   }
-  heading_midpoint =
-      context->state.yaw_rad + (delta_yaw * 0.5f);
+  else if (heading_mode != ODOMETRY_HEADING_MODEL_ONLY)
+  {
+    imu_fallback = true;
+  }
+
+  delta_yaw = NormalizeYaw(next_heading - context->state.yaw_rad);
+  heading_midpoint = NormalizeYaw(
+      context->state.yaw_rad + (delta_yaw * 0.5f));
 
   context->state.x_m += delta_distance_m * cosf(heading_midpoint);
   context->state.y_m += delta_distance_m * sinf(heading_midpoint);
-  context->state.yaw_rad =
-      NormalizeYaw(context->state.yaw_rad + delta_yaw);
+  context->state.yaw_rad = next_heading;
   context->state.distance_m += delta_distance_m;
   context->state.linear_speed_mps = linear_speed_mps;
   context->state.yaw_rate_rad_s = delta_yaw / dt_seconds;
@@ -225,20 +265,30 @@ static bool IntegrateWithCurvature(
   {
     context->state.status_flags &= ~ODOMETRY_STATUS_IMU_FUSED;
   }
+  if (imu_fallback)
+  {
+    context->state.status_flags |= ODOMETRY_STATUS_IMU_HEADING_FALLBACK;
+  }
+  else
+  {
+    context->state.status_flags &= ~ODOMETRY_STATUS_IMU_HEADING_FALLBACK;
+  }
   context->state.update_valid = true;
   return true;
 }
 
-bool Odometry_UpdateFused(OdometryContext *context,
-                          float delta_distance_m,
-                          float linear_speed_mps,
-                          float measured_wheel_angle_deg,
-                          bool steering_valid,
-                          float dt_seconds,
-                          uint32_t now_ms,
-                          bool imu_yaw_rate_valid,
-                          float imu_yaw_rate_rad_s,
-                          float imu_weight)
+bool Odometry_UpdateWithHeading(
+    OdometryContext *context,
+    float delta_distance_m,
+    float linear_speed_mps,
+    float measured_wheel_angle_deg,
+    bool steering_valid,
+    float dt_seconds,
+    uint32_t now_ms,
+    bool imu_heading_valid,
+    float imu_yaw_rad,
+    OdometryHeadingMode heading_mode,
+    float heading_correction_weight)
 {
   float wheel_angle_rad;
   float tangent;
@@ -304,9 +354,10 @@ bool Odometry_UpdateFused(OdometryContext *context,
                                 curvature,
                                 false,
                                 dt_seconds,
-                                imu_yaw_rate_valid,
-                                imu_yaw_rate_rad_s,
-                                imu_weight);
+                                imu_heading_valid,
+                                imu_yaw_rad,
+                                heading_mode,
+                                heading_correction_weight);
 }
 
 bool Odometry_Update(OdometryContext *context,
@@ -317,19 +368,21 @@ bool Odometry_Update(OdometryContext *context,
                      float dt_seconds,
                      uint32_t now_ms)
 {
-  return Odometry_UpdateFused(context,
-                              delta_distance_m,
-                              linear_speed_mps,
-                              measured_wheel_angle_deg,
-                              steering_valid,
-                              dt_seconds,
-                              now_ms,
-                              false,
-                              0.0f,
-                              0.0f);
+  return Odometry_UpdateWithHeading(
+      context,
+      delta_distance_m,
+      linear_speed_mps,
+      measured_wheel_angle_deg,
+      steering_valid,
+      dt_seconds,
+      now_ms,
+      false,
+      0.0f,
+      ODOMETRY_HEADING_MODEL_ONLY,
+      0.0f);
 }
 
-bool Odometry_UpdateFromCenterSteeringFused(
+bool Odometry_UpdateFromCenterSteeringWithHeading(
     OdometryContext *context,
     float delta_distance_m,
     float linear_speed_mps,
@@ -337,9 +390,10 @@ bool Odometry_UpdateFromCenterSteeringFused(
     bool steering_valid,
     float dt_seconds,
     uint32_t now_ms,
-    bool imu_yaw_rate_valid,
-    float imu_yaw_rate_rad_s,
-    float imu_weight)
+    bool imu_heading_valid,
+    float imu_yaw_rad,
+    OdometryHeadingMode heading_mode,
+    float heading_correction_weight)
 {
   float center_angle_rad;
   float curvature;
@@ -379,9 +433,10 @@ bool Odometry_UpdateFromCenterSteeringFused(
                                 curvature,
                                 true,
                                 dt_seconds,
-                                imu_yaw_rate_valid,
-                                imu_yaw_rate_rad_s,
-                                imu_weight);
+                                imu_heading_valid,
+                                imu_yaw_rad,
+                                heading_mode,
+                                heading_correction_weight);
 }
 
 bool Odometry_UpdateFromCenterSteering(
@@ -393,7 +448,7 @@ bool Odometry_UpdateFromCenterSteering(
     float dt_seconds,
     uint32_t now_ms)
 {
-  return Odometry_UpdateFromCenterSteeringFused(
+  return Odometry_UpdateFromCenterSteeringWithHeading(
       context,
       delta_distance_m,
       linear_speed_mps,
@@ -403,5 +458,6 @@ bool Odometry_UpdateFromCenterSteering(
       now_ms,
       false,
       0.0f,
+      ODOMETRY_HEADING_MODEL_ONLY,
       0.0f);
 }

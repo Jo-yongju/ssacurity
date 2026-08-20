@@ -61,7 +61,7 @@
 #define VEHICLE_STEERING_SENSOR_SIDE 0U
 
 /*
- * BNO085 mounting and odometry fusion.
+ * BNO085 mounting and odometry heading correction.
  * Mount the module rigidly with its sensor X axis forward, Y axis left, and
  * Z axis up. Positive Z angular rate must therefore mean a left/CCW turn.
  * Change VEHICLE_IMU_YAW_SIGN to -1.0f if the final physical mounting reverses
@@ -76,8 +76,20 @@
 #define VEHICLE_IMU_MIN_FUSION_ACCURACY      1U
 #define VEHICLE_IMU_MAX_YAW_RATE_RAD_S       10.0f
 #define VEHICLE_IMU_YAW_SIGN                 1.0f
-#define VEHICLE_IMU_FUSION_WEIGHT            0.75f
 #define VEHICLE_IMU_FUSION_MIN_SPEED_MPS     0.02f
+
+#define VEHICLE_ODOMETRY_HEADING_MODEL_ONLY     0U
+#define VEHICLE_ODOMETRY_HEADING_COMPLEMENTARY 1U
+#define VEHICLE_ODOMETRY_HEADING_IMU_ONLY      2U
+
+#ifndef VEHICLE_ODOMETRY_HEADING_MODE
+#define VEHICLE_ODOMETRY_HEADING_MODE \
+    VEHICLE_ODOMETRY_HEADING_IMU_ONLY
+#endif
+
+#ifndef VEHICLE_IMU_HEADING_CORRECTION_WEIGHT
+#define VEHICLE_IMU_HEADING_CORRECTION_WEIGHT 0.75f
+#endif
 
 /*
  * Full calibrated steering-command range. Positive steering is left/CCW.

@@ -16,12 +16,20 @@ typedef enum
 
 typedef enum
 {
+  ODOMETRY_HEADING_MODEL_ONLY = 0U,
+  ODOMETRY_HEADING_COMPLEMENTARY = 1U,
+  ODOMETRY_HEADING_IMU_ONLY = 2U
+} OdometryHeadingMode;
+
+typedef enum
+{
   ODOMETRY_STATUS_NONE = 0U,
   ODOMETRY_STATUS_GEOMETRY_INVALID = (1UL << 0),
   ODOMETRY_STATUS_STEERING_INVALID = (1UL << 1),
   ODOMETRY_STATUS_INPUT_INVALID = (1UL << 2),
   ODOMETRY_STATUS_STEERING_ESTIMATED = (1UL << 3),
-  ODOMETRY_STATUS_IMU_FUSED = (1UL << 4)
+  ODOMETRY_STATUS_IMU_FUSED = (1UL << 4),
+  ODOMETRY_STATUS_IMU_HEADING_FALLBACK = (1UL << 5)
 } OdometryStatus;
 
 typedef struct
@@ -54,6 +62,8 @@ typedef struct
 {
   OdometryGeometry geometry;
   OdometryState state;
+  bool imu_heading_reference_valid;
+  float imu_heading_offset_rad;
 } OdometryContext;
 
 void Odometry_Init(OdometryContext *context);
@@ -72,16 +82,18 @@ bool Odometry_Update(OdometryContext *context,
                      bool steering_valid,
                      float dt_seconds,
                      uint32_t now_ms);
-bool Odometry_UpdateFused(OdometryContext *context,
-                          float delta_distance_m,
-                          float linear_speed_mps,
-                          float measured_wheel_angle_deg,
-                          bool steering_valid,
-                          float dt_seconds,
-                          uint32_t now_ms,
-                          bool imu_yaw_rate_valid,
-                          float imu_yaw_rate_rad_s,
-                          float imu_weight);
+bool Odometry_UpdateWithHeading(
+    OdometryContext *context,
+    float delta_distance_m,
+    float linear_speed_mps,
+    float measured_wheel_angle_deg,
+    bool steering_valid,
+    float dt_seconds,
+    uint32_t now_ms,
+    bool imu_heading_valid,
+    float imu_yaw_rad,
+    OdometryHeadingMode heading_mode,
+    float heading_correction_weight);
 bool Odometry_UpdateFromCenterSteering(
     OdometryContext *context,
     float delta_distance_m,
@@ -90,7 +102,7 @@ bool Odometry_UpdateFromCenterSteering(
     bool steering_valid,
     float dt_seconds,
     uint32_t now_ms);
-bool Odometry_UpdateFromCenterSteeringFused(
+bool Odometry_UpdateFromCenterSteeringWithHeading(
     OdometryContext *context,
     float delta_distance_m,
     float linear_speed_mps,
@@ -98,9 +110,10 @@ bool Odometry_UpdateFromCenterSteeringFused(
     bool steering_valid,
     float dt_seconds,
     uint32_t now_ms,
-    bool imu_yaw_rate_valid,
-    float imu_yaw_rate_rad_s,
-    float imu_weight);
+    bool imu_heading_valid,
+    float imu_yaw_rad,
+    OdometryHeadingMode heading_mode,
+    float heading_correction_weight);
 
 #ifdef __cplusplus
 }
