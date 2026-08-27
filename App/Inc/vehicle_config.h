@@ -110,7 +110,7 @@
  * 0: keep range telemetry, but do not stop motion for range/health results.
  * 1: enforce the ultrasonic caution/stop/stale safety state machine.
  */
-#define VEHICLE_ENFORCE_ULTRASONIC_SAFETY 0U
+#define VEHICLE_ENFORCE_ULTRASONIC_SAFETY 1U
 
 /*
  * The current vehicle has no rear range sensor.  Allow reverse commands while
