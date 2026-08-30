@@ -1,151 +1,244 @@
 # SSACURITY STM32 Drive Controller
 
-![MCU](https://img.shields.io/badge/MCU-STM32F429ZI-03234B?logo=stmicroelectronics&logoColor=white)
+![MCU](https://img.shields.io/badge/MCU-STM32F429-03234B?logo=stmicroelectronics&logoColor=white)
 ![RTOS](https://img.shields.io/badge/RTOS-FreeRTOS-2E8B57)
-![Protocol](https://img.shields.io/badge/UART%20Protocol-0x02-4B5563)
-![Status](https://img.shields.io/badge/Status-System%20Integration-F59E0B)
+![UART](https://img.shields.io/badge/Link-UART5-4B5563)
 
-SSACURITY 자율주행 차량의 하위 주행 제어를 담당하는 STM32 펌웨어입니다.
-Jetson이 목표 속도와 조향각을 전달하면 STM32가 모터·서보를 실시간 제어하고,
-엔코더와 BNO085를 융합한 오도메트리 및 안전 상태를 다시 Jetson으로
-전송합니다.
+<p align="center">
+  <img src="assets/robot_overview.jpg" width="720" alt="SSACURITY security robot">
+</p>
 
-> 인터페이스 문서 버전은 **V3.0**, 실제 wire protocol의 `VERSION` 필드는
-> **`0x02`**입니다.
+SSACURITY 보안로봇의 STM32 주행 제어 펌웨어이다.
 
-## Project Status
+Jetson에서 목표 속도와 조향각을 보내면 STM32가 모터, 조향, 초음파 안전정지, 오도메트리, 통신 상태를 처리한다.  
+이 README는 전체 프로젝트 중 STM32 쪽만 정리했다.
 
-| 영역 | 현재 상태 | 비고 |
-| --- | --- | --- |
-| Jetson 통신 | 구현 및 Echo 검증 | UART5, 115200 8-N-1, DMA RX/TX |
-| 구동 모터 | 폐루프 속도 제어 구현 | 엔코더 피드백 PI 제어, 최대 95% PWM |
-| 조향 서보 | 실차 7점 LUT 적용 | 직진 1231 us, 비대칭 좌·우 조향 범위 |
-| IMU | BNO085 SPI5 연동 | gyro Z 기반 yaw 보정, g0 데이터 사용 허용 |
-| 오도메트리 | 엔코더·아커만·IMU 융합 | `0x85` 텔레메트리 20 Hz |
-| 초음파 안전 | 거리 텔레메트리 활성화 | 현재 로컬 정지는 시험상 일시 비활성화 |
-| 90도 회전 | Jetson 제어 절차 정의 | 최종 실차 반복 오차 검증 진행 필요 |
+<!-- 구동 영상 업로드 후 추가
+## Demo
 
-현재 펌웨어는 시스템 연동 단계입니다. 기능 구현 완료와 실제 바닥·최종 하중
-조건의 성능 검증 완료는 구분합니다.
+[![SSACURITY Driving Demo](https://img.youtube.com/vi/VIDEO_ID/0.jpg)](https://www.youtube.com/watch?v=VIDEO_ID)
+-->
 
-## Key Features
+---
 
-- `CMD_DRIVE` 기반 목표 속도·조향 제어와 300 ms 통신 watchdog
-- TIM4 quadrature encoder를 사용하는 100 Hz 속도 PI 제어
-- MG996R 실측 7점 LUT 및 구간별 선형 보간
-- BNO085 SHTP over SPI5 드라이버와 gyro Z 기반 yaw 보정
-- 명령 조향각 기반 아커만 오도메트리와 IMU 가중 융합
-- HC-SR04 입력 캡처, 3점 median filter, 선택형 로컬 장애물 정지
-- UART DMA, ring buffer, CRC-16/CCITT-FALSE, 지속형 stream parser
-- 상태·Fault·거리·IMU·오도메트리 텔레메트리
-- 모터·엔코더·서보·오도메트리용 PC/Jetson 진단 도구
+## 기능
 
-## System Architecture
+- FreeRTOS 기반 주행 제어
+- 엔코더 기반 DC 모터 속도 제어
+- 실측값 기반 조향 LUT
+- Jetson ↔ STM32 UART 통신
+- 통신 끊김 Watchdog / Neutral Rearm
+- HC-SR04 기반 전방 안전정지
+- BNO085 + 엔코더 오도메트리
+
+### 결과 요약
+
+| 항목 | 결과 |
+| --- | --- |
+| 속도 측정 | 100 / 150 / 250 mm/s 구간 STD **71.8 / 71.6 / 61.7% 감소** |
+| Feedforward | 250 mm/s 추종률 **88.1% → 98.2%** |
+| Feedforward | 250 mm/s MAE **29.86 → 7.16 mm/s** |
+| Anti-windup | 포화 해제 후 MAE **59.9% 감소** |
+| Heading | MODEL_ONLY **8.19°** → IMU_ONLY **1.32° MAE** |
+| 직선거리 | 1 m 3회 평균 **1018 mm**, 평균 절대오차 **1.8%** |
+
+---
+
+## 전체 구조
 
 ```mermaid
 flowchart LR
-    J["Jetson<br/>경로 계획 · 회전 제어"]
-    C["CommTask<br/>UART5 DMA · Protocol"]
-    CT["ControlTask<br/>속도 PI · 조향 LUT"]
-    ST["SafetyTask<br/>Watchdog · 장애물 정지"]
-    OT["OdometryTask<br/>Ackermann + IMU"]
-    IT["ImuTask<br/>BNO085 SPI5"]
-    UT["UltrasonicTask<br/>HC-SR04"]
-    E["Encoder<br/>TIM4"]
-    M["BTS7960 + DC Motor"]
-    S["MG996R Servo"]
+    J["Jetson"]
+    STM["STM32F429<br/>FreeRTOS"]
+    M["DC Motor<br/>BTS7960"]
+    S["Steering Servo"]
+    E["Encoder"]
+    U["HC-SR04"]
+    I["BNO085"]
 
-    J <-->|"UART5 115200 bps"| C
-    C -->|"speed mm/s · steering cdeg"| CT
-    CT --> M
-    CT --> S
-    E --> CT
-    E --> OT
-    IT --> OT
-    UT --> ST
-    ST --> CT
-    OT -->|"pose · yaw · velocity"| C
-    IT -->|"IMU telemetry"| C
-    ST -->|"fault · state"| C
+    J -->|"speed / steering"| STM
+    STM -->|"telemetry / fault / odometry"| J
+
+    STM --> M
+    STM --> S
+
+    E --> STM
+    U --> STM
+    I --> STM
 ```
 
-Jetson은 경로와 행동을 결정하고, STM32는 주기 제어와 로컬 안전을 책임지는
-구조입니다. IMU는 서보 PWM을 직접 바꾸지 않고 오도메트리의 yaw 변화량을
-보정합니다.
+Jetson은 목표값을 보내고, 실제 출력과 안전 처리는 STM32에서 한다.  
+통신이 끊기거나 전방에 장애물이 잡혀도 STM32 쪽에서 모터를 끌 수 있게 했다.
 
-## Hardware
+---
 
-### Main Components
+## FreeRTOS
 
-| 부품 | 역할 |
-| --- | --- |
-| STM32F429I-DISC1 / STM32F429ZIT6 | 실시간 제어 및 센서 수집 |
-| Jetson | 상위 경로 계획 및 주행 명령 생성 |
-| BTS7960 | 12 V 구동 모터 H-bridge |
-| DC motor + quadrature encoder | 차량 구동 및 속도 피드백 |
-| MG996R | 아커만 조향 서보 |
-| BNO085 | gyro·quaternion·linear acceleration |
-| HC-SR04 | 전방 근접 장애물 감지 |
+기능별로 Task를 나눴다.
 
-### Pin Map
-
-| 기능 | STM32F429I-DISC1 | Peripheral | 연결 대상 |
+| Task | 실행 | Priority | 역할 |
 | --- | --- | --- | --- |
-| Jetson TX → STM RX | PD2 / P1-40 | UART5_RX / AF8 | Jetson TX |
-| Jetson RX ← STM TX | PC12 / P1-43 | UART5_TX / AF8 | Jetson RX |
-| Motor RPWM | PA0 / P2-18 | TIM5_CH1 / 20 kHz | BTS7960 RPWM |
-| Motor LPWM | PA3 / P2-19 | TIM5_CH4 / 20 kHz | BTS7960 LPWM |
-| Motor R_EN / L_EN | PE2 / PE3 | GPIO output | BTS7960 enable |
-| Encoder A / B | PB6 / PB7 | TIM4_CH1 / CH2 | Quadrature encoder |
-| Steering PWM | PB4 / P1-25 | TIM3_CH1 / 50 Hz | MG996R signal |
-| Ultrasonic TRIG | PA5 / P2-21 | GPIO output | HC-SR04 TRIG |
-| Ultrasonic ECHO | PB3 / P1-28 | TIM2_CH2 input capture | HC-SR04 ECHO |
-| IMU SCK / MISO / MOSI | PF7 / PF8 / PF9 | SPI5 | BNO085 SCL / SDA / ADO |
-| IMU CS / INT / RST | PF6 / PG3 / PG2 | GPIO / EXTI3 | BNO085 |
-| Steering sensor reserve | PC3 / P2-15 | ADC1_IN13 | 현재 미연결 |
+| `SafetyTask` | 10 ms | High | 초음파 상태 판단 |
+| `ControlTask` | 10 ms | AboveNormal | 속도/조향 제어, 출력 |
+| `ImuTask` | DRDY event | AboveNormal | BNO085 데이터 처리 |
+| `OdometryTask` | 20 ms | Normal | 위치/Heading 계산 |
+| `CommTask` | 반복 실행 | Normal | UART, Watchdog, Telemetry |
+| `UltrasonicTask` | 60 ms | Normal | 거리 측정, Median Filter |
 
-BNO085 모듈은 `VCC`, `PS1`, `PS0`를 3.3 V에 연결하고 모든 장치의 GND를
-공통으로 묶습니다. Jetson 또는 USB-UART의 VCC는 STM32에 연결하지 않습니다.
+Control과 Safety는 10 ms 주기로 돌리고, IMU는 Polling 대신 DRDY 인터럽트가 들어왔을 때 처리한다.  
+Odometry와 초음파는 제어주기와 분리했다.
 
-전원 분배와 전체 배선은 [최종 차량 배선도](docs/final_vehicle_wiring.md)를
-참조하십시오. 구동 모터와 서보 전원을 STM32 3.3 V 핀에서 공급하면 안 됩니다.
+고정주기 Task는 `osDelayUntil()`을 사용했다. ISR에서는 계산을 길게 하지 않고 필요한 이벤트나 측정값만 넘긴다.
 
-## Firmware Architecture
+```mermaid
+flowchart TD
+    RX["UART5 RX DMA"] --> COMM["CommTask"]
+    COMM --> CMD["ControlCommand"]
 
-| Task | 주기/구동 방식 | 책임 |
-| --- | ---: | --- |
-| `ControlTask` | 10 ms | 엔코더 속도, PI 제어, 모터 PWM, 조향 LUT |
-| `SafetyTask` | 10 ms | 초음파·제어 상태 평가, 출력 차단 요청 |
-| `UltrasonicTask` | 60 ms | HC-SR04 측정 및 median filter |
-| `OdometryTask` | 20 ms | 이동거리, pose, yaw, 곡률 계산 |
-| `ImuTask` | INT 기반 | BNO085 report 수신 및 상태 관리 |
-| `CommTask` | 1 ms | UART parser, 명령 적용, 텔레메트리 송신 |
+    ENC["Encoder"] --> CONTROL["ControlTask<br/>10 ms"]
+    CMD --> CONTROL
+    SAFE["SafetyRequest"] --> CONTROL
+    CONTROL --> MOTOR["Motor PWM"]
+    CONTROL --> SERVO["Servo PWM"]
 
-주요 디렉터리는 다음과 같습니다.
+    ULTRA["HC-SR04"] --> UTASK["UltrasonicTask<br/>60 ms"]
+    UTASK --> SAFETY["SafetyTask<br/>10 ms"]
+    SAFETY --> SAFE
+
+    IMU["BNO085 DRDY"] --> ITASK["ImuTask"]
+    ITASK --> ODOM["OdometryTask<br/>20 ms"]
+    ENC --> ODOM
+    ODOM --> COMM
+```
+
+---
+
+## 모터 속도 제어
+
+속도 제어는 처음부터 한 번에 맞춘 게 아니라, 실차에서 문제가 보일 때마다 순서대로 손봤다.
+
+### 10 ms 제어 / 50 ms 속도 측정
+
+엔코더는 `823 count/rev`, 바퀴 둘레는 약 `0.20106 m`이다.
+
+10 ms마다 바로 속도를 계산하면 1 count 차이가 약 `24.43 mm/s`로 잡혀 저속에서 측정값이 많이 흔들렸다.
+
+제어주기를 50 ms로 늦추는 대신, **제어는 10 ms 그대로 두고 속도 측정만 최근 5개 샘플을 사용**했다.
 
 ```text
-App/                FreeRTOS task, 제어·안전·오도메트리 로직
-Core/               CubeMX 초기화, UART transport/protocol/service
-Drivers/BSP/        Motor, encoder, ultrasonic, BNO085 드라이버
-Middlewares/        FreeRTOS 및 CMSIS-RTOS2
-tools/              PC/Jetson UART 진단 도구
-docs/               배선, 프로토콜, 센서 및 트러블슈팅 문서
-artifacts/          Jetson 팀 전달용 통합 자료
+Control / PI          = 10 ms
+Speed measurement     = 50 ms
+
+1 count @ 10 ms ≈ 24.43 mm/s
+1 count @ 50 ms ≈  4.89 mm/s
 ```
 
-## Control and Odometry
+<p align="center">
+  <img src="assets/speed_window_3run_mean.png" width="880" alt="Before and after 50 ms encoder speed measurement">
+</p>
 
-### Drive Control
+| Target | Before STD | After STD | 감소 |
+| ---: | ---: | ---: | ---: |
+| 100 mm/s | 26.33 | 7.43 | **71.8%** |
+| 150 mm/s | 23.84 | 6.77 | **71.6%** |
+| 250 mm/s | 18.68 | 7.16 | **61.7%** |
 
-- 속도 명령 범위: `-1565 .. +1565 mm/s`
-- 모터 출력 제한: `±95% PWM`
-- 제어 주기: `100 Hz`
-- 속도 제어기: `Kp=120`, `Ki=20`, `Kd=0`
-- 명령이 300 ms 동안 갱신되지 않으면 PWM과 enable을 차단
+제어주기는 그대로라서 반응주기를 늦춘 건 아니다. 엔코더 속도 계산 구간만 넓혔다.
 
-### Steering
+### Feedforward
 
-| 조향각 | PWM pulse |
+50 ms 적용 후에는 속도값 흔들림은 줄었지만, 250 mm/s에서 목표속도보다 계속 낮게 나왔다.
+
+실차에서 측정한 속도와 Duty 관계를 선형회귀해서 기본 Duty를 만들고, PI는 그 위에서 오차만 보정하게 바꿨다.
+
+```text
+측정값 회귀:
+duty[%] ≈ 18.57 + 46.02 × speed[m/s]    (R² = 0.987)
+
+적용값:
+Feedforward[%] = 18.5 + 46.5 × |target_speed[m/s]|
+```
+
+현재 Gain은 아래와 같다.
+
+```text
+Kp = 120
+Ki = 20
+Kd = 0
+dt = 0.010 s
+```
+
+`Kd=0`이라 실제 동작은 PI이다.
+
+<p align="center">
+  <img src="assets/feedforward_3run_mean.png" width="880" alt="Before and after speed feedforward">
+</p>
+
+250 mm/s 구간에서 3회 평균 기준:
+
+- 추종률: **88.1% → 98.2%**
+- MAE: **29.86 → 7.16 mm/s**
+- MAE 감소: **76.0%**
+
+### Anti-windup
+
+출력이 포화된 상태에서 오차가 계속 크면 적분값이 쌓여서, 이후 목표속도를 낮춰도 복귀가 늦어질 수 있다.
+
+`1500 → 100 mm/s`로 목표를 바꿔 포화를 만든 뒤 Anti-windup ON/OFF를 각각 3회 비교했다.
+
+현재는 Conditional Integration을 사용한다.
+
+- 포화가 아니면 적분
+- 포화 상태라도 오차가 포화를 푸는 방향이면 적분
+- 반대 방향이면 Integral 유지
+
+<p align="center">
+  <img src="assets/antiwindup_3run_mean.png" width="880" alt="Anti-windup on vs off after saturation release">
+</p>
+
+100 mm/s 구간 마지막 1초 MAE:
+
+```text
+OFF : 117.06 mm/s
+ON  :  46.90 mm/s
+
+59.9% 감소
+```
+
+---
+
+## 조향
+
+조향각 센서를 달 계획이었지만, 최종 조립 상태에서는 센서와 자석을 넣을 공간이 나오지 않았다.
+
+그래서 단순히 Servo PWM을 각도로 비례 변환하지 않고, 실제 바퀴를 놓고 Pulse 7점에서 좌·우 조향각을 직접 쟀다.
+
+<p align="center">
+  <img src="assets/steering_measurement.jpg" width="650" alt="Physical steering angle measurement">
+</p>
+
+| Pulse | Left | Right |
+| ---: | ---: | ---: |
+| 750 us | +15° | +22° |
+| 905 us | +10° | +17° |
+| 1060 us | +8° | +12° |
+| 1215 us | 0° | 0° |
+| 1370 us | -8° | -6° |
+| 1525 us | -17° | -18° |
+| 1680 us | -29° | -26° |
+
+좌우 바퀴각이 같지 않아서 단순 평균은 쓰지 않았다.  
+각 바퀴의 곡률을 계산한 뒤 차량 중심 기준 등가 조향각으로 바꿔 LUT를 만들었다.
+
+차량 치수는 `L=0.135 m`, `T=0.085 m`를 사용했다.
+
+최종 조립 후 직진점이 `1215 us`에서 `1231 us`로 바뀌어서 LUT 전체에 `+16 us` trim을 적용했다.
+
+<p align="center">
+  <img src="assets/steering_lut.png" width="720" alt="Final 7 point steering LUT">
+</p>
+
+| Equivalent angle | Servo pulse |
 | ---: | ---: |
 | +19.55° | 766 us |
 | +14.18° | 921 us |
@@ -155,238 +248,289 @@ artifacts/          Jetson 팀 전달용 통합 자료
 | -17.56° | 1541 us |
 | -28.69° | 1696 us |
 
-양수 조향은 좌회전/CCW, 음수 조향은 우회전/CW입니다. 조향센서가 아직
-장착되지 않았으므로 오도메트리는 서보 명령에 대응하는 LUT 각도를 사용하며
-`STEERING_ESTIMATED`를 표시합니다.
+중간값은 구간별 선형보간으로 계산한다.
 
-### IMU-fused Odometry
+현재 조향은 실제 각도 Feedback이 없는 **보정된 Open-loop 방식**이다.
 
-휠베이스 `0.135 m`, 전륜 조향 트랙 `0.085 m`의 아커만 모델로 회전량을
-계산하고 BNO085 gyro Z 적분값을 다음과 같이 융합합니다.
+---
 
-```text
-delta_yaw = 0.25 * ackermann_delta_yaw + 0.75 * imu_delta_yaw
-```
+## Jetson ↔ STM32 통신
 
-차량 속도가 `0.02 m/s` 이상이고 IMU의 연결·gyro·freshness 조건을 만족할 때
-융합합니다. 현재는 일정상 BNO085 accuracy gate를 비활성화하여 `g0`도
-사용합니다. IMU가 끊기거나 stale이면 아커만 단독 적분으로 자동 복귀합니다.
-
-## UART Protocol
+UART5를 사용하고, 문자열 대신 Binary Frame으로 통신한다.
 
 ```text
-[AA][55][02][MSG_ID][SEQ][LEN][PAYLOAD 0..64][CRC_L][CRC_H]
+[AA][55][02][MSG_ID][SEQ][LEN][PAYLOAD][CRC_L][CRC_H]
 ```
 
-- UART5 `115200 8-N-1`, 3.3 V TTL, flow control 없음
-- Little-endian payload
-- CRC-16/CCITT-FALSE
-- 메시지 종류와 무관한 단일 8-bit TX sequence
-- 350 ms 동안 유효 frame이 없으면 새 sequence session 허용
-- RX DMA circular buffer + software ring, TX DMA queue
+주행 중에는 Command와 Telemetry가 계속 오가기 때문에 Frame 경계, CRC, 중복 Command, 통신 끊김을 따로 처리했다.
 
-### Jetson → STM32
-
-| ID | Message | Payload | 용도 |
-| ---: | --- | ---: | --- |
-| `0x10` | `CMD_DRIVE` | 5 B | 속도, 조향각, enable |
-| `0x11` | `CMD_STOP` | 1 B | 즉시 안전정지 요청 |
-| `0x12` | `CMD_RESET_FAULT` | 4 B | 확인한 fault 해제 요청 |
-| `0xF0` | `DIAG_ECHO_REQUEST` | 0..31 B | UART 물리 경로 진단 |
-| `0xF2` | `DIAG_MOTOR_TEST_REQUEST` | 4 B | 제한시간 모터 진단 |
-| `0xF6` | `DIAG_SERVO_REQUEST` | 2 B | 원시 서보 pulse 진단 |
-
-### STM32 → Jetson
-
-| ID | Message | 주기/용도 |
-| ---: | --- | --- |
-| `0x80` | `TELEMETRY_DRIVE` | 20 Hz, 속도·PWM·조향·state |
-| `0x81` | `FAULT_EVENT` | fault 변화 이벤트 |
-| `0x82` | `COMMAND_RESULT` | STOP/RESET 및 진단 결과 |
-| `0x83` | `TELEMETRY_IMU` | 20 Hz, gyro·accel·quaternion |
-| `0x84` | `TELEMETRY_RANGE` | 10 Hz, 전방 초음파 거리 |
-| `0x85` | `TELEMETRY_ODOMETRY` | 20 Hz, pose·yaw·속도·곡률 |
-
-`CMD_DRIVE`는 개별 `COMMAND_RESULT`를 반환하지 않습니다. Jetson은
-`TELEMETRY_DRIVE.last_drive_seq` 또는
-`TELEMETRY_ODOMETRY.last_drive_seq`로 명령 수락 여부를 확인해야 합니다.
-
-전체 byte layout과 fault bit 정의는
-[Jetson–STM32 UART Interface V3](docs/jetson_stm32_uart_interface_v3.md)에
-정리되어 있습니다.
-
-## Safety Model
-
-| 조건 | STM32 동작 |
+| 처리 | 방식 |
 | --- | --- |
-| 유효한 `CMD_DRIVE`가 300 ms 없음 | `COMM_TIMEOUT`, neutral, `SAFE_STOP` |
-| 초음파 거리·상태 | 현재 report-only, 거리 텔레메트리 유지 |
-| 로컬 정지를 다시 `1U`로 활성화한 경우 | 0.20 m 미만 STOP, 0.30 m 이상 새 측정 3회 후 해제 |
-| CRC/잘못된 명령/범위 초과 | 명령 거부 및 fault 보고 |
-| 내부 제어·방향·stall fault | 출력 차단 또는 latched stop |
+| Frame 경계 | SOF + LEN |
+| 데이터 손상 | CRC-16/CCITT-FALSE |
+| 중복/과거 Command | 8-bit SEQ |
+| RX | 256 B Circular DMA |
+| Buffer | 512 B Software Ring |
+| Stream parsing | Persistent Parser |
+| 불완전 Frame | 100 ms timeout |
+| Drive Command 끊김 | 300 ms Watchdog |
+| 통신 복구 후 재출발 방지 | Neutral Rearm |
 
-`SAFE_STOP` 이후에는 neutral `CMD_DRIVE(0,0,0)`을 보내고 `READY`를 확인한
-다음 새 주행 명령을 보내는 흐름을 권장합니다.
+```text
+UART5 RX
+↓
+Circular DMA
+↓
+Software Ring
+↓
+Parser
+↓
+LEN / CRC / SEQ 확인
+↓
+Command Validation
+↓
+ControlCommand
+```
 
-현재 물리 E-stop 입력과 독립적인 모터 에너지 차단 회로는 확정되지 않았습니다.
-UART `CMD_STOP`은 물리 E-stop을 대체하지 않습니다.
+주요 Message ID:
 
-## Getting Started
+| ID | Message |
+| ---: | --- |
+| `0x10` | `CMD_DRIVE` |
+| `0x11` | `CMD_STOP` |
+| `0x12` | `CMD_RESET_FAULT` |
+| `0x80` | `TELEMETRY_DRIVE` |
+| `0x81` | `FAULT_EVENT` |
+| `0x82` | `COMMAND_RESULT` |
+| `0x83` | `TELEMETRY_IMU` |
+| `0x84` | `TELEMETRY_RANGE` |
+| `0x85` | `TELEMETRY_ODOMETRY` |
 
-### Requirements
+Watchdog은 UART Byte 수신 여부가 아니라 **정상적으로 수락된 새 `CMD_DRIVE`**를 기준으로 갱신한다.
+
+300 ms 동안 새 Drive Command가 없으면:
+
+```text
+COMM_TIMEOUT
+→ SAFE_STOP
+→ Neutral Rearm 필요
+```
+
+통신이 다시 붙었다고 바로 움직이지 않고, Neutral `CMD_DRIVE(0, 0, 0)`을 한 번 받은 뒤 다음 주행명령을 받도록 했다.
+
+`300 ms`는 통신 끊김을 감지하는 시간이지 차량의 물리적 정지시간은 아니다.
+
+UART5 실제 연결에서 Echo를 확인했고, CRC 오류, 잘린 Frame, 잘못된 LEN, duplicate/old SEQ, 범위 밖 속도/조향 명령도 따로 넣어 확인했다.
+
+---
+
+## 초음파 안전정지
+
+전방 HC-SR04는 거리 Telemetry만 보내는 용도가 아니라 STM32에서 바로 모터를 멈추는 Local Safety에 사용한다.
+
+Echo는 TIM2 Input Capture로 받고, ISR에서는 Pulse Width만 확보한다. 실제 거리 계산과 Filter는 `UltrasonicTask`에서 한다.
+
+```text
+TRIG              = 10 us
+Measurement period= 60 ms
+Echo timeout      = 30 ms
+Valid range       = 0.03 ~ 4.00 m
+Filter            = 3-sample Median
+Sensor stale      = 200 ms
+```
+
+단일 측정값에 바로 반응하지 않도록 Median Filter를 넣었고, STOP 경계에서 상태가 계속 바뀌지 않도록 진입/해제 거리를 다르게 잡았다.
+
+| 상태 | 조건 |
+| --- | --- |
+| CAUTION | `< 0.60 m` |
+| CAUTION 해제 | `>= 0.65 m` |
+| STOP | `< 0.40 m` |
+| STOP 해제 후보 | `>= 0.50 m` |
+| 실제 해제 | `0.50 m 이상 정상 Sample 3회 연속` |
+
+```mermaid
+flowchart LR
+    RANGE["HC-SR04"]
+    FILTER["UltrasonicTask<br/>Median"]
+    SAFETY["SafetyTask"]
+    REQUEST["SafetyRequest"]
+    CONTROL["ControlTask"]
+    MOTOR["PI reset<br/>Motor disable"]
+
+    RANGE --> FILTER --> SAFETY --> REQUEST --> CONTROL --> MOTOR
+```
+
+Timeout, Out-of-range, Stale 상태도 안전 측으로 처리한다.
+
+물리 E-stop이나 별도 Motor Power Cutoff 회로까지 구현한 것은 아니다.
+
+---
+
+## Odometry / BNO085
+
+이동거리는 엔코더, Heading은 BNO085를 사용한다.
+
+```text
+Distance → Encoder
+Heading  → BNO085 Game Rotation Vector
+
+IMU invalid / stale
+→ Steering LUT + Bicycle Model fallback
+```
+
+처음에는 조향 LUT와 엔코더 거리로 Bicycle Model Heading을 계산했다.
+
+90° 좌·우 회전 시험에서 `MODEL_ONLY` MAE가 8.19°였고, BNO085 Heading을 사용했을 때는 1.32°였다. Model과 IMU를 섞은 0.75 Fusion도 같이 비교했지만 1.65°로 IMU 단독보다 좋지 않았다.
+
+<p align="center">
+  <img src="assets/heading_source_mae.png" width="680" alt="Heading source MAE comparison">
+</p>
+
+| Heading source | MAE |
+| --- | ---: |
+| `MODEL_ONLY` | **8.19°** |
+| `IMU_ONLY` | **1.32°** |
+| Fusion `0.75` | **1.65°** |
+
+IMU_ONLY의 좌/우 MAE는 각각 `1.23°`, `1.41°`였다.
+
+그래서 최종 기본 Heading Source는 `IMU_ONLY`로 두고, IMU 데이터가 유효하지 않을 때만 Model로 fallback한다.
+
+여기서 `IMU_ONLY`는 Heading만 IMU를 쓴다는 뜻이다. 이동거리는 계속 엔코더로 계산한다.
+
+### 직선거리 확인
+
+<p align="center">
+  <img src="assets/encoder_distance_validation.png" width="620" alt="One meter encoder distance validation">
+</p>
+
+1 m 직선주행 3회 결과:
+
+```text
+1015 mm
+1021 mm
+1018 mm
+
+평균 1018 mm
+평균 절대오차 1.8%
+```
+
+이 값은 1 m 직선 누적거리 결과이고, 전체 2D Odometry 정확도를 뜻하지는 않는다.
+
+---
+
+## 검증
+
+| 항목 | 확인 방법 |
+| --- | --- |
+| 속도 측정 | 50 ms 적용 전/후 동일 Staircase 3회 |
+| Feedforward | 적용 전/후 동일 Profile 3회 |
+| Anti-windup | 1500 → 100 mm/s ON/OFF 각 3회 |
+| 조향 | Servo Pulse 7점에서 좌/우 바퀴각 실측 |
+| UART | Echo, CRC/LEN/SEQ/범위 오류 주입 |
+| Watchdog | 300 ms timeout → SAFE_STOP → Neutral Rearm |
+| 초음파 | 장애물 진입 시 Motor Disable 확인 |
+| 거리 | 1 m 직선 3회 |
+| Heading | 좌/우 약 90° MODEL / IMU / Fusion 비교 |
+
+---
+
+## Hardware
+
+<p align="center">
+  <img src="assets/robot_front.jpg" width="520" alt="SSACURITY robot front hardware">
+</p>
+
+| 부품 | 용도 |
+| --- | --- |
+| STM32F429I-DISC1 | 주행 제어 |
+| BTS7960 | DC 모터 드라이버 |
+| DC Motor + Encoder | 구동 / 속도 측정 |
+| MG996R | 조향 Servo |
+| BNO085 | Heading |
+| HC-SR04 | 전방 거리 측정 |
+
+주요 연결:
+
+| 기능 | STM32 | Peripheral |
+| --- | --- | --- |
+| Jetson 통신 | PC12 / PD2 | UART5 TX / RX |
+| Motor PWM | PA0 / PA3 | TIM5, 20 kHz |
+| Encoder | PB6 / PB7 | TIM4 Encoder Mode |
+| Steering PWM | PB4 | TIM3, 50 Hz |
+| Ultrasonic ECHO | PB3 | TIM2 Input Capture |
+| BNO085 | PF6~PF9, PG2~PG3 | SPI5 / GPIO / EXTI |
+
+전체 배선은 [`docs/final_vehicle_wiring.md`](docs/final_vehicle_wiring.md)에 정리했다.
+
+---
+
+## Repository
+
+```text
+App/
+├─ Inc/
+└─ Src/
+   ├─ app_freertos.c
+   ├─ task_control.c
+   ├─ task_safety.c
+   ├─ task_ultrasonic.c
+   ├─ task_imu.c
+   ├─ task_odometry.c
+   ├─ pid.c
+   └─ safety.c
+
+Core/
+├─ Inc/
+└─ Src/
+   ├─ comm_protocol.c
+   ├─ comm_service.c
+   └─ uart_transport.c
+
+Drivers/BSP/
+├─ motor
+├─ encoder
+├─ steering
+├─ ultrasonic
+└─ bno085
+
+tools/
+└─ 테스트 / 진단 스크립트
+
+docs/
+└─ 배선 / 통신 / 구현 문서
+```
+
+---
+
+## Build
+
+필요 환경:
 
 - STM32CubeIDE
-- STM32CubeF4 firmware package
-- ST-LINK USB driver
-- Python 3.10+ 및 `pyserial` — 호스트 진단 도구 사용 시
-- 3.3 V USB-UART — PC에서 UART5 물리 경로를 시험할 때
-
-### Clone and Build
+- STM32CubeF4
+- ST-LINK
+- Python 3.10+ / `pyserial` (진단 스크립트)
 
 ```bash
-git clone https://github.com/galahad0310/ssacurity-stm32-drive.git
-cd ssacurity-stm32-drive
+git clone https://github.com/Jo-yongju/ssacurity.git
+cd ssacurity
 ```
 
-1. STM32CubeIDE에서 `Existing Projects into Workspace`로 저장소를 가져옵니다.
-2. [vehicle_config.h](App/Inc/vehicle_config.h)의 현재 차량 설정을 확인합니다.
-3. `Debug` configuration으로 Build합니다.
-4. ST-LINK로 `Debug/ssacurity-stm32-drive.elf`를 플래시합니다.
+STM32CubeIDE에서 프로젝트를 Import한 뒤 Build / Flash하면 된다.
 
-CubeMX로 코드를 재생성한 경우 GPIO 초기 출력과 SPI5 공유 장치인 온보드
-L3GD20의 CS 상태를 포함해 `git diff`를 반드시 검토하십시오.
+차량별 설정값은 `App/Inc/vehicle_config.h`에 모아뒀다.
 
-### Active Communication Port
+---
 
-현재 브랜치는 최종 Jetson 연동을 위해 UART5를 활성화한 상태입니다.
+## Limitations
 
-```c
-#define VEHICLE_COMM_USE_STLINK_VCP 0U
-```
-
-| 설정 | 통신 경로 | 사용 상황 |
-| ---: | --- | --- |
-| `0U` | UART5, PC12/PD2 | Jetson 또는 외부 USB-UART |
-| `1U` | USART1, ST-LINK VCP | PC 벤치 시험 전용 |
-
-PC의 ST-LINK VCP로 IMU 벤치 시험을 다시 수행할 때만 `1U`로 변경하고,
-시험 후에는 `0U`로 복구하여 다시 빌드·플래시합니다.
-
-## Verification
-
-### Host-only Protocol Test
-
-```bash
-python3 -m pip install pyserial
-python3 tools/uart_protocol_test.py self-test
-python3 tools/jetson_uart_echo_test.py --self-test
-```
-
-### Jetson ↔ UART5 Echo
-
-```bash
-python3 tools/jetson_uart_echo_test.py \
-  --port /dev/ttyUSB0 \
-  --text JETSON
-```
-
-정상 결과:
-
-```text
-Jetson <-> STM32 UART5 echo: PASS
-```
-
-### Telemetry Monitor
-
-```bash
-python3 tools/uart_protocol_test.py telemetry-monitor \
-  --port /dev/ttyUSB0 \
-  --seconds 10
-```
-
-### BNO085 All-values Monitor
-
-현재 PC 시험 펌웨어를 플래시한 뒤 ST-LINK COM 포트에서 실행합니다.
-
-```powershell
-py tools\uart_protocol_test.py imu-monitor `
-  --port COM11 `
-  --seconds 30 `
-  --settle-seconds 3 `
-  --rate-hz 2 `
-  --csv imu_test.csv
-```
-
-이 명령은 모터·서보·주행 명령을 보내지 않고 roll/pitch/yaw, quaternion,
-gyro XYZ, linear acceleration XYZ, accuracy와 IMU 상태를 출력합니다.
-
-### Drive and Odometry Test
-
-> 아래 시험은 반드시 구동 바퀴를 공중에 띄운 상태에서 수행하십시오.
-
-```bash
-python3 tools/uart_protocol_test.py drive-scenario \
-  --port /dev/ttyUSB0 \
-  --profile basic \
-  --wheels-off-ground
-
-python3 tools/uart_protocol_test.py odometry-test \
-  --port /dev/ttyUSB0 \
-  --wheels-off-ground
-```
-
-사용 가능한 모든 진단 명령은 다음 명령으로 확인할 수 있습니다.
-
-```bash
-python3 tools/uart_protocol_test.py --help
-```
-
-## Runtime Configuration
-
-주요 실차 설정은 [vehicle_config.h](App/Inc/vehicle_config.h)에 모여 있습니다.
-
-| 설정 | 현재 값 | 의미 |
-| --- | ---: | --- |
-| `VEHICLE_MAX_ABS_SPEED_MM_S` | `1565` | 속도 명령 절댓값 제한 |
-| `VEHICLE_MIN_STEERING_CDEG` | `-2869` | 우측 조향 한계 |
-| `VEHICLE_MAX_STEERING_CDEG` | `1955` | 좌측 조향 한계 |
-| `VEHICLE_IMU_FUSION_WEIGHT` | `0.75` | yaw 변화량의 IMU 가중치 |
-| `VEHICLE_IMU_ENFORCE_ACCURACY_GATE` | `0` | BNO085 g0 허용 |
-| `VEHICLE_ENFORCE_ULTRASONIC_SAFETY` | `0` | 현재 로컬 정지 시험상 비활성화 |
-| `VEHICLE_ALLOW_REVERSE_WITHOUT_REAR_SENSOR` | `1` | 후방 센서 없이 후진 허용 |
-| `VEHICLE_COMM_USE_STLINK_VCP` | `0` | 현재 Jetson/UART5 통합 모드 |
-
-## Documentation
-
-| 문서 | 내용 |
-| --- | --- |
-| [최종 차량 배선도](docs/final_vehicle_wiring.md) | 전원, 공통 GND, 전체 핀 연결 |
-| [Jetson–STM32 UART Interface V3](docs/jetson_stm32_uart_interface_v3.md) | frame, payload, state, fault 명세 |
-| [BNO085 SPI5 Integration](docs/bno085_spi5_integration.md) | IMU 배선, 드라이버, 시험 절차 |
-| [Ultrasonic Safety](docs/day3_ultrasonic_safety.md) | 거리 임계값 및 정지 시험 |
-| [Jetson AI Implementation Prompt](docs/jetson_ai_implementation_prompt.md) | Jetson 구현 요구사항 |
-| [Yaw 90° Handover](artifacts/jetson_yaw90_handover_2026-08-03/README.md) | 90도 회전 연동 자료 |
-| [Troubleshooting](docs/troubleshooting/README.md) | 개발 과정과 고장 진단 기록 |
-
-## Known Limitations
-
-- 조향센서가 미장착 상태라 실제 바퀴각이 아닌 명령 기반 LUT를 사용합니다.
-- BNO085가 `g0`을 보고해도 현재는 일정상 gyro 데이터를 융합합니다.
-- 단일 전방 HC-SR04만 사용하며 후방·측면 장애물을 관측하지 않습니다.
-- 초음파 로컬 정지는 현재 비활성화되어 있으므로 Jetson이 거리 텔레메트리를
-  감시해 정지 명령을 내려야 합니다.
-- HC-SR04의 `NO_ECHO`는 먼 거리와 ECHO 배선 이탈을 구분할 수 없습니다.
-- 최종 하중·노면에서의 최고속도, 제동거리, 90도 회전 반복 오차는 추가 실차
-  검증 대상입니다.
-- 물리 E-stop 및 독립적인 모터 전원 차단 경로가 아직 없습니다.
-
-## Final Hardware Checklist
-
-- [ ] 모든 장치의 GND가 공통으로 연결되어 있는가
-- [ ] Jetson TX/RX가 STM32 RX/TX와 교차 연결되어 있는가
-- [ ] 모터·서보 전원이 STM32 논리 전원과 분리되어 있는가
-- [ ] BNO085가 차체에 수평·강성 고정되어 있는가
-- [ ] HC-SR04 정면에 차체 부품이나 배선이 걸리지 않는가
-- [ ] 바퀴 공중 시험에서 watchdog과 장애물 STOP이 동작하는가
-- [ ] 바닥 저속 시험에서 조향 부호와 yaw 부호가 일치하는가
-- [ ] Jetson이 `last_drive_seq`, state, fault를 감시하는가
+- 조향각 Feedback Sensor가 없어 현재 조향은 LUT 기반 Open-loop 방식이다.
+- 초음파 센서는 전방 1개만 사용한다.
+- Encoder + IMU Odometry는 상대 위치 추정이다.
+- 1 m 시험은 누적거리 검증이며 2D Trajectory Ground Truth 시험은 하지 않았다.
+- RTOS의 WCET, Jitter, Stack High-water Mark는 별도로 정량 측정하지 않았다.
+- CRC는 통신 오류 검출용이며 인증이나 암호화 기능은 없다.
+- UART5는 3.3 V TTL이다.
+- 물리 E-stop과 독립 Motor Power Cutoff는 구현하지 않았다.
