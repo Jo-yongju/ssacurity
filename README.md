@@ -246,8 +246,6 @@ ON  :  46.90 mm/s
 
 중간값은 구간별 선형보간으로 계산한다.
 
-현재 조향은 실제 각도 Feedback이 없는 **보정된 Open-loop 방식**이다.
-
 ---
 
 ## Jetson ↔ STM32 통신
@@ -359,8 +357,6 @@ flowchart LR
 
 Timeout, Out-of-range, Stale 상태도 안전 측으로 처리한다.
 
-물리 E-stop이나 별도 Motor Power Cutoff 회로까지 구현한 것은 아니다.
-
 ---
 
 ## Odometry / BNO085
@@ -412,7 +408,6 @@ IMU_ONLY의 좌/우 MAE는 각각 `1.23°`, `1.41°`였다.
 평균 절대오차 1.8%
 ```
 
-이 값은 1 m 직선 누적거리 결과이고, 전체 2D Odometry 정확도를 뜻하지는 않는다.
 
 ---
 
