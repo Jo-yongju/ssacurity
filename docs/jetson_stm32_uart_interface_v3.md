@@ -196,8 +196,9 @@ last_drive_seq
 | 6 | IMU heading fallback used |
 
 현재 기본 heading mode는 `IMU_ONLY`다. 연결·quaternion 유효·100 ms 이내
-수신·유한 yaw 조건을 만족하면 bit 4가 1이다. 현재 accuracy gate는
-`VEHICLE_IMU_MIN_ACCURACY=0`으로 비활성화되어 있다. IMU heading이
+수신·유한 yaw 조건을 만족하면 bit 4가 1이다. 현재
+`VEHICLE_IMU_ENFORCE_ACCURACY_GATE=0U`이므로 BNO085 accuracy 값으로 heading
+사용을 차단하지 않는다. IMU heading이
 유효하지 않거나 stale이면 bit 4가 0, bit 6이 1로 바뀌고 엔코더+조향 LUT의
 model heading으로 자동 복귀한다. `MODEL_ONLY`, `COMPLEMENTARY`, `IMU_ONLY`
 세 모드가 있으며 complementary correction weight는 0.75다. 공중 바퀴

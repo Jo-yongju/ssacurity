@@ -70,8 +70,9 @@ GY-BNO08X 모듈은 **3.3 V로만** 공급하고 STM32와 GND를 공통으로 �
 - quaternion report가 100 ms 이내에 수신됨
 - yaw가 유한값임
 
-BNO085 accuracy는 텔레메트리에 보고하지만 현재 설정
-`VEHICLE_IMU_MIN_ACCURACY=0`에서는 heading 사용을 차단하지 않는다. 조건이
+BNO085 accuracy는 텔레메트리에 보고하지만 현재
+`VEHICLE_IMU_ENFORCE_ACCURACY_GATE=0U`이므로 accuracy 값으로 heading 사용을
+차단하지 않는다. 조건이
 깨지면 pose 적분을 중단하지 않고 엔코더+조향 LUT의 bicycle model로 자동
 복귀한다. 이때 `COMM_FAULT_IMU_LOST`는 report-only이고 차량을 강제
 정지시키지 않으며, odometry의 `IMU_FUSED` bit는 0,
