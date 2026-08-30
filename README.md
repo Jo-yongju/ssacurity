@@ -234,10 +234,6 @@ ON  :  46.90 mm/s
 
 최종 조립 후 직진점이 `1215 us`에서 `1231 us`로 바뀌어서 LUT 전체에 `+16 us` trim을 적용했다.
 
-<p align="center">
-  <img src="assets/steering_lut.png" width="720" alt="Final 7 point steering LUT">
-</p>
-
 | Equivalent angle | Servo pulse |
 | ---: | ---: |
 | +19.55° | 766 us |
@@ -460,7 +456,7 @@ IMU_ONLY의 좌/우 MAE는 각각 `1.23°`, `1.41°`였다.
 | Encoder | PB6 / PB7 | TIM4 Encoder Mode |
 | Steering PWM | PB4 | TIM3, 50 Hz |
 | Ultrasonic ECHO | PB3 | TIM2 Input Capture |
-| BNO085 | PF6~PF9, PG2~PG3 | SPI5 / GPIO / EXTI |
+| BNO085 | PF6, PF7, PF8, PF9 / PG2, PG3 | SPI5 / GPIO / EXTI |
 
 전체 배선은 [`docs/final_vehicle_wiring.md`](docs/final_vehicle_wiring.md)에 정리했다.
 
@@ -501,36 +497,3 @@ tools/
 docs/
 └─ 배선 / 통신 / 구현 문서
 ```
-
----
-
-## Build
-
-필요 환경:
-
-- STM32CubeIDE
-- STM32CubeF4
-- ST-LINK
-- Python 3.10+ / `pyserial` (진단 스크립트)
-
-```bash
-git clone https://github.com/Jo-yongju/ssacurity.git
-cd ssacurity
-```
-
-STM32CubeIDE에서 프로젝트를 Import한 뒤 Build / Flash하면 된다.
-
-차량별 설정값은 `App/Inc/vehicle_config.h`에 모아뒀다.
-
----
-
-## Limitations
-
-- 조향각 Feedback Sensor가 없어 현재 조향은 LUT 기반 Open-loop 방식이다.
-- 초음파 센서는 전방 1개만 사용한다.
-- Encoder + IMU Odometry는 상대 위치 추정이다.
-- 1 m 시험은 누적거리 검증이며 2D Trajectory Ground Truth 시험은 하지 않았다.
-- RTOS의 WCET, Jitter, Stack High-water Mark는 별도로 정량 측정하지 않았다.
-- CRC는 통신 오류 검출용이며 인증이나 암호화 기능은 없다.
-- UART5는 3.3 V TTL이다.
-- 물리 E-stop과 독립 Motor Power Cutoff는 구현하지 않았다.
