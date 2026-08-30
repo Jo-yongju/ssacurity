@@ -35,6 +35,9 @@ Parser는 256-byte 지속 버퍼에서 SOF를 재탐색한다. version, length, 
 오류 시 후보 SOF의 첫 바이트만 버리며, 불완전 frame은 100 ms 후 같은
 방식으로 복구한다.
 
+UART5 수신은 256-byte DMA 버퍼에서 512-byte software RX ring으로 옮겨
+stream parser가 처리한다. 송신 ring도 512 byte다.
+
 ## 3. 메시지
 
 | ID | 이름 | 방향 | Payload | 주기 |
@@ -52,6 +55,8 @@ Parser는 256-byte 지속 버퍼에서 SOF를 재탐색한다. version, length, 
 | `0xF1` | `DIAG_ECHO_RESP` | STM32 → Jetson | 1..32 | 개발 |
 | `0xF2` | `DIAG_MOTOR_TEST_REQ` | PC → STM32 | 4 | 벤치 |
 | `0xF3` | `DIAG_MOTOR_TEST_RESP` | STM32 → PC | 6 | 벤치 |
+| `0xF6` | `DIAG_SERVO_REQUEST` | PC → STM32 | 2 | 벤치 |
+| `0xF7` | `DIAG_SERVO_RESPONSE` | STM32 → PC | 7 | 벤치 |
 
 기존 V1의 `0x82 TELEMETRY_ODOMETRY`와 `0xF4..0xF5` PID 진단은 V3 활성 UART
 프로토콜에서 사용하지 않는다. `0xF2..0xF3` 모터 진단은 실차 배선 확인을 위해
@@ -82,9 +87,34 @@ last_drive_seq
 active_fault_bits
 ```
 
-IMU 융합 중에는 `yaw_cdeg`가 융합 odometry yaw이며, IMU가 유효하지 않으면
-0이다. `last_drive_seq`는 마지막으로 실제
-수락한 `CMD_DRIVE`의 SEQ이며, 거부된 명령에서는 갱신하지 않는다.
+`yaw_cdeg`는 pose update가 유효할 때의 odometry yaw다. 현재 기본
+`IMU_ONLY`에서는 정렬된 quaternion yaw를 사용하고, IMU heading이 유효하지
+않거나 stale이면 엔코더+조향 LUT의 model heading을 사용한다.
+`last_drive_seq`는 마지막으로 실제 수락한 `CMD_DRIVE`의 SEQ이며, 거부된
+명령에서는 갱신하지 않는다.
+
+`active_fault_bits`와 14-byte `FAULT_EVENT`의 active/latched fault bit는
+다음과 같다.
+
+| bit | 이름 |
+| ---: | --- |
+| 0 | `COMM_TIMEOUT` |
+| 1 | `CRC_ERROR` |
+| 2 | `BAD_COMMAND` |
+| 3 | `ENCODER_INVALID` |
+| 4 | `MOTOR_STALL` |
+| 5 | `DIRECTION` |
+| 6 | `CONTROL_OVERRUN` |
+| 7 | `IMU_LOST` |
+| 8 | `RANGE_LOST` |
+| 9 | `STEERING_INVALID` |
+| 10 | `ESTOP_ACTIVE` |
+| 11 | `INTERNAL` |
+| 12 | `COMMAND_LIMIT` |
+| 13 | `UART_RX_OVERFLOW` |
+| 14 | `UART_TX_ERROR` |
+| 15 | `SENSOR_STALE` |
+| 16 | `OBSTACLE_NEAR` |
 
 ### TELEMETRY_IMU
 
@@ -105,15 +135,31 @@ status bit 0~6은 각각 `CONNECTED`, `GYRO_VALID`, `LINEAR_ACCEL_VALID`,
 `QUATERNION_VALID`, `STALE`, `SPI_ERROR`, `PROTOCOL_ERROR`다. BNO085 accuracy는
 0=unreliable, 1=low, 2=medium, 3=high다.
 
+### TELEMETRY_RANGE
+
+13-byte payload 순서는 다음과 같다.
+
+```text
+<IHHHHB
+mcu_time_ms
+front_left_mm
+front_right_mm
+rear_left_mm
+rear_right_mm
+valid_mask
+```
+
 현재 단일 전방 HC-SR04는 V3의 primary front 슬롯인
 `front_left_mm`/`valid_mask bit 0`으로 임시 매핑한다. 물리적인 좌/우 위치가
 확정됐다는 의미는 아니며, `ULTRA_STATUS_OK`이고 200 ms 이내인 측정만
 valid다. 나머지 세 채널은 `0xFFFF`/invalid로 유지한다.
 
-현재 작업 브랜치는 `VEHICLE_ENFORCE_ULTRASONIC_SAFETY=0U`이다. Range frame은
-계속 전송하지만 센서 invalid/stale 또는 근접 장애물에 의한 STM32 로컬 STOP과
-`OBSTACLE_NEAR`는 발생하지 않는다. 로컬 정지를 복구할 경우 `1U`로 변경하고
-0.20 m STOP·0.30 m 해제 조건과 실차 정지거리를 다시 검증해야 한다.
+현재 설정은 `VEHICLE_ENFORCE_ULTRASONIC_SAFETY=1U`이며 STM32가 로컬 안전
+정지를 수행한다. CAUTION은 0.60 m에서 진입하고 0.65 m에서 해제된다. 거리가
+0.40 m 미만이면 STOP하며, 0.50 m 이상인 새로운 샘플을 3회 연속 확인한 뒤
+해제한다. 새로운 `NO_ECHO` 샘플은 최대 유효 거리 방향으로 평가하지만,
+`INIT`/`TIMEOUT`/`OUT_OF_RANGE`/`STALE` 또는 200 ms 이상 갱신되지 않은
+`NO_ECHO`는 STOP한다. 근접 정지 시 `OBSTACLE_NEAR` fault가 설정된다.
 
 ### TELEMETRY_ODOMETRY
 
@@ -145,14 +191,18 @@ last_drive_seq
 | 1 | encoder calibrated |
 | 2 | wheelbase/track geometry calibrated |
 | 3 | steering command estimate used |
-| 4 | IMU fused |
+| 4 | IMU heading used |
 | 5 | input invalid |
+| 6 | IMU heading fallback used |
 
-gyro report가 100 ms 이내이고 연결·gyro 유효 조건을 만족하며 차량 속도가
-0.02 m/s 이상이면 bit 4가 1이다. 현재 펌웨어는 accuracy gate가 비활성화되어
-g0도 융합한다. IMU가 stale이면 bit 4가 0으로 내려가고 기존
-엔코더+조향 모델로 자동 복귀한다. 공중 바퀴 시험은 계산 부호와 UART 전송만
-검증하며 실제 바닥 위치 정확도를 보증하지 않는다.
+현재 기본 heading mode는 `IMU_ONLY`다. 연결·quaternion 유효·100 ms 이내
+수신·유한 yaw 조건을 만족하면 bit 4가 1이다. 현재 accuracy gate는
+`VEHICLE_IMU_MIN_ACCURACY=0`으로 비활성화되어 있다. IMU heading이
+유효하지 않거나 stale이면 bit 4가 0, bit 6이 1로 바뀌고 엔코더+조향 LUT의
+model heading으로 자동 복귀한다. `MODEL_ONLY`, `COMPLEMENTARY`, `IMU_ONLY`
+세 모드가 있으며 complementary correction weight는 0.75다. 공중 바퀴
+시험은 계산 부호와 UART 전송만 검증하며 실제 바닥 위치 정확도를 보증하지
+않는다.
 
 ## 4. 안전 동작
 
@@ -162,8 +212,8 @@ g0도 융합한다. IMU가 stale이면 bit 4가 0으로 내려가고 기존
 - `CMD_STOP`과 `CMD_RESET_FAULT`는 `COMMAND_RESULT`를 반환
 - 현재 속도 명령 범위는 실측 지속속도 기준 `-1565~+1565 mm/s`이다.
 - 현재 모터 출력 상한은 무부하 포화 측정점인 절댓값 95% PWM이다.
-- 현재 초음파 거리·상태는 report-only다. Jetson이 거리 텔레메트리를 감시해
-  정지 명령을 내려야 한다.
+- 초음파 안전은 활성화되어 있다. 근접 장애물과 invalid/stale 센서 상태에서
+  STM32가 로컬 STOP하고 PID를 reset하며 모터 출력을 차단한다.
 - 조향 범위는 비대칭 `-28.69°~+19.55°`이며 7점 LUT 측정 범위와 같다.
 - 위 한계보다 큰 `drive_enable=1` 명령은 거부
 - UART `CMD_STOP`은 물리 E-stop을 대체하지 않는다.
@@ -186,7 +236,7 @@ heartbeat, 속도 PID, 서보 명령, `TELEMETRY_DRIVE`, `CMD_STOP` 경로를
 전제:
 
 - 차량을 뒤집거나 구동 바퀴를 모두 지면에서 띄운다.
-- HC-SR04 정면 30 cm 이내를 비운다.
+- HC-SR04 정면 65 cm 이내를 비워 CLEAR 상태를 확보한다.
 - 12 V 모터 전원, 서보용 5 V 강압 전원, STM32 GND가 공통인지 확인한다.
 - 업데이트된 펌웨어를 플래시한 뒤 보드를 한 번 리셋한다.
 
@@ -219,8 +269,10 @@ py tools\uart_protocol_test.py drive-scenario `
 `PC-as-Jetson full scenario: PASS`가 나와야 한다.
 
 현재 조향센서는 미장착이다. 따라서 `steering_feedback_cdeg`는
-0(유효하지 않음)이지만, 오도메트리는 실측한 7점 등가 중심각 LUT와
-휠베이스 0.135 m를 이용해 명령 조향각 기반으로 적분한다.
+0(유효하지 않음)이다. 오도메트리 이동거리는 엔코더로 계산하고, 기본
+heading은 정렬된 BNO085 Game Rotation Vector quaternion yaw를 사용한다.
+IMU heading이 유효하지 않거나 stale이면 실측 7점 등가 중심각 LUT와
+휠베이스 0.135 m의 model heading으로 자동 복귀한다.
 `TELEMETRY_ODOMETRY`의 `steering_source=2`와
 `STEERING_ESTIMATED`가 설정된 경우에만 이 추정 pose를 사용한다.
 기구 유격·서보 미도달·타이어 미끄러짐은 감지할 수 없으므로 실제 바닥
@@ -264,17 +316,25 @@ Jetson <-> STM32 UART5 echo: PASS
 - 서보 7점 LUT: 766, 921, 1076, 1231, 1386, 1541, 1696 us
 - 통신 watchdog: 300 ms
 - 오도메트리 송신: `0x85`, 36 byte, 20 Hz
+- 기본 heading mode: `IMU_ONLY`, 유효하지 않을 때 model fallback
+- 초음파 로컬 안전: 활성화, STOP 0.40 m 미만, 해제 후보 0.50 m 이상 3회
+
+실차에서 확인한 결과:
+
+- 1 m 직선 거리: 1015, 1021, 1018 mm, 평균 1018 mm, 평균 절대 오차 1.8%
+- heading MAE: `MODEL_ONLY` 8.19도, `IMU_ONLY` 1.32도,
+  `COMPLEMENTARY(0.75)` 1.65도
+- `IMU_ONLY` 좌회전 MAE 1.23도, 우회전 MAE 1.41도
 
 실제 차량에서 아직 검증하거나 확정해야 하는 항목:
 
-- 하중 상태 타이어 실구름 둘레와 바닥 직선거리 오차
-- 바닥 주행 회전반경과 명령 기반 yaw 오차
+- 다양한 하중·노면에서의 타이어 실구름 둘레 재현성
+- 전체 2D 경로의 위치 오차와 반복 주행 재현성
 - 기구 유격, 서보 미도달 및 타이어 미끄러짐
 - HC-SR04의 V3 front-left/front-right 채널 배치
-- 0.20 m 강제정지값의 실제 바닥 정지거리 검증
+- 0.40 m 강제정지값의 실제 바닥 정지거리 검증
 - 물리 E-stop 입력과 독립 모터 에너지 차단 경로
 - 실제 Jetson UART 장치 경로와 UART5 물리 Echo
-- IMU 장착 후 yaw 보정과 `TELEMETRY_IMU` 포맷
 
 엔코더 값은 정방향 3회전 +2473, 역방향 3회전 -2464를 평균해
 823 count/바퀴 1회전으로 결정했다.

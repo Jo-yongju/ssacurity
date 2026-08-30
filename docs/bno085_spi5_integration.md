@@ -1,4 +1,4 @@
-# BNO085 SPI5 및 오도메트리 융합
+# BNO085 SPI5 및 오도메트리 heading
 
 ## 1. 확정 배선
 
@@ -52,27 +52,34 @@ GY-BNO08X 모듈은 **3.3 V로만** 공급하고 STM32와 GND를 공통으로 �
 
 ## 4. 오도메트리 융합
 
-기존 모델은 엔코더 이동거리와 조향각으로 회전량을 계산한다.
+이동거리는 모든 모드에서 엔코더로 계산한다. Heading은
+`VEHICLE_ODOMETRY_HEADING_MODE`에 따라 선택하며 현재 기본값은
+`IMU_ONLY`다.
 
-```text
-model_delta_yaw = encoder_delta_distance × steering_curvature
-imu_delta_yaw   = gyro_z × 0.020 s
-fused_delta_yaw = 0.25 × model_delta_yaw + 0.75 × imu_delta_yaw
-```
+- `MODEL_ONLY`: 엔코더 이동거리와 조향 LUT의 등가 중심각을 bicycle model에
+  넣어 heading을 계산한다.
+- `COMPLEMENTARY`: model heading을 예측값으로 사용하고, 정렬된 quaternion
+  yaw와의 오차를 `NormalizeYaw()`한 뒤 `0.75` 가중치로 보정한다.
+- `IMU_ONLY`: 정렬된 Game Rotation Vector quaternion yaw를 heading으로
+  사용한다.
 
-다음 조건을 모두 만족할 때만 IMU를 섞는다.
+첫 유효 quaternion yaw가 들어오면 현재 odometry yaw와 일치하도록 offset을
+잡는다. 이후 IMU heading 사용 가능 조건은 다음과 같다.
 
-- calibrated gyro report가 100 ms 이내에 수신됨
-- BNO085 accuracy는 텔레메트리에 보고하지만 현재 긴급 시운전 설정에서는 융합을 차단하지 않음
-- 차량 측정 속도의 절댓값이 0.02 m/s 이상
-- yaw rate가 유한값이며 절댓값 10 rad/s 이하
+- BNO085 연결 상태이고 quaternion report가 유효함
+- quaternion report가 100 ms 이내에 수신됨
+- yaw가 유한값임
 
-조건이 깨지면 pose 적분을 중단하지 않고 기존 엔코더+조향 아커만 방식으로
-자동 복귀한다. 이때 `COMM_FAULT_IMU_LOST`는 report-only이고 차량을 강제
-정지시키지 않으며, odometry의 `IMU_FUSED` bit만 0이 된다.
+BNO085 accuracy는 텔레메트리에 보고하지만 현재 설정
+`VEHICLE_IMU_MIN_ACCURACY=0`에서는 heading 사용을 차단하지 않는다. 조건이
+깨지면 pose 적분을 중단하지 않고 엔코더+조향 LUT의 bicycle model로 자동
+복귀한다. 이때 `COMM_FAULT_IMU_LOST`는 report-only이고 차량을 강제
+정지시키지 않으며, odometry의 `IMU_FUSED` bit는 0,
+`IMU_HEADING_FALLBACK` bit는 1이 된다.
 
-0.75 가중치는 첫 시운전용 값이다. 바닥 원주행과 직진 시험으로 자이로 부호,
-바이어스, 조향 모델 오차를 확인한 뒤 조정해야 한다.
+현재 비교 시험에서 heading MAE는 `MODEL_ONLY` 8.19도, `IMU_ONLY` 1.32도,
+`COMPLEMENTARY(0.75)` 1.65도였다. `IMU_ONLY`의 좌회전 MAE는 1.23도,
+우회전 MAE는 1.41도였다. 이 결과에 따라 현재 기본 모드는 `IMU_ONLY`다.
 
 ## 5. UART IMU 텔레메트리
 
@@ -121,14 +128,17 @@ status bit는 `CONNECTED`, `GYRO_VALID`, `LINEAR_ACCEL_VALID`,
 6. `CONNECTED`, `GYRO_VALID`, `LINEAR_ACCEL_VALID`, `QUATERNION_VALID`가 있고
    stale/error bit가 0인지 확인한다. Accuracy는 기록하되 현재 융합 차단
    조건은 아니다.
-7. 왼쪽 회전에서 `gyro_z`와 `delta_yaw`가 양수, 오른쪽에서 음수인지
+7. 왼쪽 회전에서 quaternion yaw가 증가하고 오른쪽에서 감소하는지
    확인한다. 방향이 반대면 배선을 바꾸지 말고 `VEHICLE_IMU_YAW_SIGN`을
    `-1.0f`로 바꾼다.
 8. 차체를 정지시킨 상태에서 gyro XYZ가 0 근처로 안정되는지 확인한다.
-9. 저속 직진·좌회전·우회전에서 odometry `IMU_FUSED`가 1인지 확인한다.
+9. 기본 `IMU_ONLY`에서 odometry `IMU_FUSED`가 1이고
+   `IMU_HEADING_FALLBACK`이 0인지 확인한다. IMU를 사용할 수 없을 때는 두
+   bit가 각각 0과 1로 바뀌고 model heading이 이어지는지 확인한다.
 10. 주행 중 INT 또는 CS 선을 분리하는 시험은 하지 않는다. 정지 상태에서 센서
    전원을 껐다 켜 `IMU_LOST`와 자동 재연결을 확인한다.
 
 정상 기준은 20 Hz IMU frame 수신, stale/error bit 0, 정지 시 gyro 안정,
-왼쪽 약 +90도·오른쪽 약 -90도 변화, 주행 중 `IMU_FUSED=1`이다. 최종 장착
-상태의 반복 각도 오차와 융합 가중치는 실제 바닥 주행에서 추가 검증한다.
+왼쪽 약 +90도·오른쪽 약 -90도 변화, 주행 중 `IMU_FUSED=1`이다. 비교 시험의
+heading MAE는 `MODEL_ONLY` 8.19도, `IMU_ONLY` 1.32도,
+`COMPLEMENTARY(0.75)` 1.65도였다.
