@@ -13,12 +13,6 @@ SSACURITY 보안로봇의 STM32 주행 제어 펌웨어이다.
 Jetson에서 목표 속도와 조향각을 보내면 STM32가 모터, 조향, 초음파 안전정지, 오도메트리, 통신 상태를 처리한다.  
 이 README는 전체 프로젝트 중 STM32 쪽만 정리했다.
 
-<!-- 구동 영상 업로드 후 추가
-## Demo
-
-[![SSACURITY Driving Demo](https://img.youtube.com/vi/VIDEO_ID/0.jpg)](https://www.youtube.com/watch?v=VIDEO_ID)
--->
-
 ---
 
 ## 기능
